@@ -2,8 +2,8 @@
 bin/
 pkg/
 
-# SeaweedFS runtime data
-seaweedFS/data/
+# Hitachi-compatible local runtime data
+hitachiFS/data/
 
 # temp files
 *.save

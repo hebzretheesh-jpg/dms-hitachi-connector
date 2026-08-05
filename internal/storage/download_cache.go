@@ -1,4 +1,4 @@
-package seaweed
+package storage
 
 import (
 	"container/list"

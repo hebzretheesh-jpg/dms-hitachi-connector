@@ -13,40 +13,40 @@ type Registry struct {
 	requests  map[string]int64
 	durations map[string]float64
 
-	pingSuccess           int64
-	pingFailure           int64
-	seaweedConnectionFail int64
+	pingSuccess      int64
+	pingFailure      int64
+	hitachiConnectionFail int64
 
-	seaweedUploadFail       map[string]int64
-	seaweedUploadSuccess    map[string]int64
-	seaweedGetStreamFail    map[string]int64
-	seaweedGetStreamSuccess map[string]int64
-	fileUploadSuccess       map[string]int64
-	fileUploadFail          map[string]int64
-	fileDownloadSuccess     map[string]int64
-	fileDownloadFail        map[string]int64
-	getStatsFail            map[string]int64
-	getStatsSuccess         map[string]int64
-	getPDFImageSuccess      map[string]int64
-	getPDFImageFail         map[string]int64
+	hitachiUploadFail        map[string]int64
+	hitachiUploadSuccess     map[string]int64
+	hitachiGetStreamFail     map[string]int64
+	hitachiGetStreamSuccess  map[string]int64
+	fileUploadSuccess   map[string]int64
+	fileUploadFail      map[string]int64
+	fileDownloadSuccess map[string]int64
+	fileDownloadFail    map[string]int64
+	getStatsFail        map[string]int64
+	getStatsSuccess     map[string]int64
+	getPDFImageSuccess  map[string]int64
+	getPDFImageFail     map[string]int64
 }
 
 func New() *Registry {
 	return &Registry{
-		requests:                map[string]int64{},
-		durations:               map[string]float64{},
-		seaweedUploadFail:       map[string]int64{},
-		seaweedUploadSuccess:    map[string]int64{},
-		seaweedGetStreamFail:    map[string]int64{},
-		seaweedGetStreamSuccess: map[string]int64{},
-		fileUploadSuccess:       map[string]int64{},
-		fileUploadFail:          map[string]int64{},
-		fileDownloadSuccess:     map[string]int64{},
-		fileDownloadFail:        map[string]int64{},
-		getStatsFail:            map[string]int64{},
-		getStatsSuccess:         map[string]int64{},
-		getPDFImageSuccess:      map[string]int64{},
-		getPDFImageFail:         map[string]int64{},
+		requests:            map[string]int64{},
+		durations:           map[string]float64{},
+		hitachiUploadFail:        map[string]int64{},
+		hitachiUploadSuccess:     map[string]int64{},
+		hitachiGetStreamFail:     map[string]int64{},
+		hitachiGetStreamSuccess:  map[string]int64{},
+		fileUploadSuccess:   map[string]int64{},
+		fileUploadFail:      map[string]int64{},
+		fileDownloadSuccess: map[string]int64{},
+		fileDownloadFail:    map[string]int64{},
+		getStatsFail:        map[string]int64{},
+		getStatsSuccess:     map[string]int64{},
+		getPDFImageSuccess:  map[string]int64{},
+		getPDFImageFail:     map[string]int64{},
 	}
 }
 
@@ -74,26 +74,26 @@ func (r *Registry) IncPingFailure() {
 	r.pingFailure++
 }
 
-func (r *Registry) IncSeaweedConnectionFail() {
+func (r *Registry) IncHitachiConnectionFail() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.seaweedConnectionFail++
+	r.hitachiConnectionFail++
 }
 
-func (r *Registry) IncSeaweedUploadFail(bucketName string) {
-	r.incByBucket(&r.mu, r.seaweedUploadFail, bucketName)
+func (r *Registry) IncHitachiUploadFail(bucketName string) {
+	r.incByBucket(&r.mu, r.hitachiUploadFail, bucketName)
 }
 
-func (r *Registry) IncSeaweedUploadSuccess(bucketName string) {
-	r.incByBucket(&r.mu, r.seaweedUploadSuccess, bucketName)
+func (r *Registry) IncHitachiUploadSuccess(bucketName string) {
+	r.incByBucket(&r.mu, r.hitachiUploadSuccess, bucketName)
 }
 
-func (r *Registry) IncSeaweedGetStreamFail(bucketName, objectName string) {
-	r.incByBucketObject(&r.mu, r.seaweedGetStreamFail, bucketName, objectName)
+func (r *Registry) IncHitachiGetStreamFail(bucketName, objectName string) {
+	r.incByBucketObject(&r.mu, r.hitachiGetStreamFail, bucketName, objectName)
 }
 
-func (r *Registry) IncSeaweedGetStreamSuccess(bucketName string) {
-	r.incByBucket(&r.mu, r.seaweedGetStreamSuccess, bucketName)
+func (r *Registry) IncHitachiGetStreamSuccess(bucketName string) {
+	r.incByBucket(&r.mu, r.hitachiGetStreamSuccess, bucketName)
 }
 
 func (r *Registry) IncFileUploadSuccess(bucketName string) {
@@ -149,12 +149,12 @@ func (r *Registry) Render() string {
 	r.renderRequestMetrics(&b)
 	r.renderSimpleCounter(&b, "ping_success_count", "Number of successful pings", r.pingSuccess)
 	r.renderSimpleCounter(&b, "ping_failure_count", "Number of failed pings", r.pingFailure)
-	r.renderSimpleCounter(&b, "seaweedfs_connection_fail_count", "Number of seaweedfs failed connection attempts", r.seaweedConnectionFail)
+	r.renderSimpleCounter(&b, "hitachi_connection_fail_count", "Number of S3 failed connection attempts", r.hitachiConnectionFail)
 
-	r.renderBucketCounter(&b, "seaweedfs_upload_fail_count", "Number of seaweedfs failed file upload attempts", r.seaweedUploadFail)
-	r.renderBucketCounter(&b, "seaweedfs_upload_success_count", "Number of seaweedfs successful file uploads", r.seaweedUploadSuccess)
-	r.renderBucketObjectCounter(&b, "seaweedfs_connection_get_stream_count", "Number of seaweedfs failed file downloads", r.seaweedGetStreamFail)
-	r.renderBucketCounter(&b, "seaweedfs_connection_get_stream_success_count", "Number of seaweedfs successful file downloads", r.seaweedGetStreamSuccess)
+	r.renderBucketCounter(&b, "hitachi_upload_fail_count", "Number of S3 failed file upload attempts", r.hitachiUploadFail)
+	r.renderBucketCounter(&b, "hitachi_upload_success_count", "Number of S3 successful file uploads", r.hitachiUploadSuccess)
+	r.renderBucketObjectCounter(&b, "hitachi_connection_get_stream_count", "Number of S3 failed file downloads", r.hitachiGetStreamFail)
+	r.renderBucketCounter(&b, "hitachi_connection_get_stream_success_count", "Number of S3 successful file downloads", r.hitachiGetStreamSuccess)
 	r.renderBucketCounter(&b, "file_upload_success_count", "Number of successful file uploads", r.fileUploadSuccess)
 	r.renderBucketObjectCounter(&b, "file_upload_fail_count", "Number of failed file uploads", r.fileUploadFail)
 	r.renderBucketCounter(&b, "file_download_success_count", "Number of successful file downloads", r.fileDownloadSuccess)

@@ -1,0 +1,21 @@
+[Unit]
+Description=DMS Hitachi Connector
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=dms-connector
+Group=dms-connector
+Environment=HITACHI_ENDPOINT=https://your-s3-endpoint
+Environment=HITACHI_ACCESS_KEY_ID=your-access-key
+Environment=HITACHI_SECRET_ACCESS_KEY=your-secret-key
+Environment=HITACHI_BUCKET=dms-connector
+Environment=LISTEN_ADDR=:9082
+ExecStart=/usr/local/bin/dms-hitachi-connector
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

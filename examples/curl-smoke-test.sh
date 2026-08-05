@@ -8,7 +8,7 @@ cat > "$TMP_FILE" <<'PDF'
 2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
 3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj
 4 0 obj<</Length 44>>stream
-BT /F1 18 Tf 50 100 Td (hello seaweedfs) Tj ET
+BT /F1 18 Tf 50 100 Td (hello hitachi) Tj ET
 endstream endobj
 trailer<</Root 1 0 R>>
 %%EOF

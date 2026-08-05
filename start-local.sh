@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 set -e
 
-set -e
-
-echo "🚀 Starting SeaweedFS..."
-docker compose -f seaweedFS/docker-compose.yaml up -d
-
-echo "⏳ Waiting for SeaweedFS to be ready..."
-sleep 5
+# This script starts only the connector binary.
+# Configure HITACHI_ENDPOINT to point at your existing Hitachi-compatible storage.
 
 echo "🔧 Setting environment variables..."
-export SEAWEEDFS_FILERS=http://127.0.0.1:8888
+export HITACHI_ENDPOINT=http://127.0.0.1:9000
+export HITACHI_ACCESS_KEY_ID=minioadmin
+export HITACHI_SECRET_ACCESS_KEY=minioadmin
+export HITACHI_BUCKET=dms-connector
+export HITACHI_OBJECT_PREFIX=/connector/dms
 export WORKER_ID=0
 export LISTEN_ADDR=":9081"   # 👈 IMPORTANT
 
 echo "▶️ Starting Go server..."
-./bin/dms-seaweedfs-connector
+./bin/dms-hitachi-connector

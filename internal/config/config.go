@@ -10,58 +10,73 @@ import (
 )
 
 type Config struct {
-	ListenAddr            string
-	ReadTimeout           time.Duration
-	WriteTimeout          time.Duration
-	IdleTimeout           time.Duration
-	FilerEndpoints        []string
-	InternalRoot          string
-	HTTPTimeout           time.Duration
-	TempDir               string
-	DownloadCacheDir      string
-	DownloadCacheMaxFiles int
-	MaxUploadBytes        int64
-	PDFFallbackDPI        int
-	WorkerID              int
+	ListenAddr             string
+	ReadTimeout            time.Duration
+	WriteTimeout           time.Duration
+	IdleTimeout            time.Duration
+	HitachiEndpoint        string
+	HitachiAccessKeyID     string
+	HitachiSecretAccessKey string
+	HitachiRegion          string
+	HitachiBucket          string
+	HitachiUsePathStyle    bool
+	InternalRoot           string
+	HTTPTimeout            time.Duration
+	TempDir                string
+	DownloadCacheDir       string
+	DownloadCacheMaxFiles  int
+	MaxUploadBytes         int64
+	PDFFallbackDPI         int
+	WorkerID               int
 }
 
 func Load() (Config, error) {
 	tempDir := getEnv("TEMP_DIR", os.TempDir())
 
 	cfg := Config{
-		ListenAddr:            getEnv("LISTEN_ADDR", ":9082"),
-		ReadTimeout:           getDurationEnv("READ_TIMEOUT", 30*time.Second),
-		WriteTimeout:          getDurationEnv("WRITE_TIMEOUT", 5*time.Minute),
-		IdleTimeout:           getDurationEnv("IDLE_TIMEOUT", 60*time.Second),
-		InternalRoot:          strings.TrimRight(getEnv("SEAWEEDFS_INTERNAL_ROOT", "/connector/dms"), "/"),
-		HTTPTimeout:           getDurationEnv("SEAWEEDFS_HTTP_TIMEOUT", 60*time.Second),
-		TempDir:               tempDir,
-		DownloadCacheDir:      getEnv("DOWNLOAD_CACHE_DIR", filepath.Join(tempDir, "dms-download-cache")),
-		DownloadCacheMaxFiles: getIntEnv("DOWNLOAD_CACHE_MAX_FILES", 128),
-		MaxUploadBytes:        getInt64Env("MAX_UPLOAD_BYTES", 64<<20),
-		PDFFallbackDPI:        getIntEnv("PDF_RENDER_DPI", 144),
-		WorkerID:              getIntEnv("WORKER_ID", 0),
+		ListenAddr:             getEnv("LISTEN_ADDR", ":9082"),
+		ReadTimeout:            getDurationEnv("READ_TIMEOUT", 30*time.Second),
+		WriteTimeout:           getDurationEnv("WRITE_TIMEOUT", 5*time.Minute),
+		IdleTimeout:            getDurationEnv("IDLE_TIMEOUT", 60*time.Second),
+		HitachiEndpoint:        getEnv("HITACHI_ENDPOINT", ""),
+		HitachiAccessKeyID:     getEnv("HITACHI_ACCESS_KEY_ID", ""),
+		HitachiSecretAccessKey: getEnv("HITACHI_SECRET_ACCESS_KEY", ""),
+		HitachiRegion:          getEnv("HITACHI_REGION", "us-east-1"),
+		HitachiBucket:          getEnv("HITACHI_BUCKET", "dms-connector"),
+		HitachiUsePathStyle:    getBoolEnv("HITACHI_USE_PATH_STYLE", true),
+		InternalRoot:           strings.Trim(strings.TrimRight(getEnv("HITACHI_OBJECT_PREFIX", "/connector/dms"), "/"), "/"),
+		HTTPTimeout:            getDurationEnv("HITACHI_HTTP_TIMEOUT", 60*time.Second),
+		TempDir:                tempDir,
+		DownloadCacheDir:       getEnv("DOWNLOAD_CACHE_DIR", filepath.Join(tempDir, "dms-download-cache")),
+		DownloadCacheMaxFiles:  getIntEnv("DOWNLOAD_CACHE_MAX_FILES", 128),
+		MaxUploadBytes:         getInt64Env("MAX_UPLOAD_BYTES", 64<<20),
+		PDFFallbackDPI:         getIntEnv("PDF_RENDER_DPI", 144),
+		WorkerID:               getIntEnv("WORKER_ID", 0),
 	}
 
-	raw := getEnv("SEAWEEDFS_FILERS", "")
-	if raw == "" {
-		return cfg, fmt.Errorf("SEAWEEDFS_FILERS must be set")
+	if cfg.HitachiEndpoint == "" {
+		return cfg, fmt.Errorf("HITACHI_ENDPOINT must be set")
 	}
-
-	for _, item := range strings.Split(raw, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-
-		cfg.FilerEndpoints = append(cfg.FilerEndpoints, strings.TrimRight(item, "/"))
+	if cfg.HitachiAccessKeyID == "" {
+		return cfg, fmt.Errorf("HITACHI_ACCESS_KEY_ID must be set")
 	}
-
-	if len(cfg.FilerEndpoints) == 0 {
-		return cfg, fmt.Errorf("SEAWEEDFS_FILERS resolved to zero endpoints")
+	if cfg.HitachiSecretAccessKey == "" {
+		return cfg, fmt.Errorf("HITACHI_SECRET_ACCESS_KEY must be set")
+	}
+	if cfg.HitachiBucket == "" {
+		return cfg, fmt.Errorf("HITACHI_BUCKET must be set")
 	}
 
 	return cfg, nil
+}
+
+func getBoolEnv(key string, fallback bool) bool {
+	if value := os.Getenv(key); value != "" {
+		value = strings.ToLower(strings.TrimSpace(value))
+		return value == "1" || value == "true" || value == "yes" || value == "on"
+	}
+
+	return fallback
 }
 
 func getEnv(key, fallback string) string {

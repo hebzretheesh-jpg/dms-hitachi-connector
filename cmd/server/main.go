@@ -10,12 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/api"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/config"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/metrics"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/seaweed"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/server"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/util"
+	"github.com/mygithub/dms-hitachi-connector/internal/api"
+	"github.com/mygithub/dms-hitachi-connector/internal/config"
+	"github.com/mygithub/dms-hitachi-connector/internal/metrics"
+	"github.com/mygithub/dms-hitachi-connector/internal/server"
+	"github.com/mygithub/dms-hitachi-connector/internal/storage"
+	"github.com/mygithub/dms-hitachi-connector/internal/util"
 )
 
 func main() {
@@ -26,14 +26,20 @@ func main() {
 
 	m := metrics.New()
 
-	client, err := seaweed.NewClient(
-		cfg.FilerEndpoints,
+	client, err := storage.NewClient(
+		cfg.HitachiEndpoint,
+		cfg.HitachiAccessKeyID,
+		cfg.HitachiSecretAccessKey,
+		cfg.HitachiRegion,
+		cfg.HitachiBucket,
+		cfg.InternalRoot,
+		cfg.HitachiUsePathStyle,
 		cfg.HTTPTimeout,
 		cfg.DownloadCacheDir,
 		cfg.DownloadCacheMaxFiles,
 	)
 	if err != nil {
-		log.Fatalf("create seaweed client: %v", err)
+		log.Fatalf("create s3 client: %v", err)
 	}
 
 	idGen, err := util.NewIDGenerator(cfg.WorkerID)
@@ -45,7 +51,7 @@ func main() {
 	srv := server.New(cfg.ListenAddr, handler, cfg.ReadTimeout, cfg.WriteTimeout, cfg.IdleTimeout)
 
 	go func() {
-		log.Printf("starting dms seaweedfs connector on %s", cfg.ListenAddr)
+		log.Printf("starting dms hitachi connector on %s", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}

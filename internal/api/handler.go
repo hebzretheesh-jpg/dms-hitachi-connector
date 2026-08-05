@@ -16,25 +16,25 @@ import (
 	"strings"
 	"time"
 
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/config"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/metrics"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/seaweed"
-	"github.com/renjithrp/dms-seaweedfs-connector/internal/util"
+	"github.com/mygithub/dms-hitachi-connector/internal/config"
+	"github.com/mygithub/dms-hitachi-connector/internal/metrics"
+	"github.com/mygithub/dms-hitachi-connector/internal/storage"
+	"github.com/mygithub/dms-hitachi-connector/internal/util"
 )
 
 type Handler struct {
 	cfg     config.Config
-	client  *seaweed.Client
+	client  *storage.Client
 	idGen   *util.IDGenerator
 	metrics *metrics.Registry
 }
 
-func New(cfg config.Config, client *seaweed.Client, idGen *util.IDGenerator, m *metrics.Registry) *Handler {
+func New(cfg config.Config, client *storage.Client, idGen *util.IDGenerator, m *metrics.Registry) *Handler {
 	return &Handler{cfg: cfg, client: client, idGen: idGen, metrics: m}
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-	fmt.Println("🔥 SEAWEEDFS HIT")
+	fmt.Println("🔥 S3 HIT")
 	fmt.Println(r)
 
 	start := time.Now()
@@ -45,7 +45,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		endpoint = "ping"
 		if err := h.client.Health(r.Context()); err != nil {
 			h.metrics.IncPingFailure()
-			h.metrics.IncSeaweedConnectionFail()
+			h.metrics.IncHitachiConnectionFail()
 			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
 		} else if err := h.idGen.HealthError(); err != nil {
 			h.metrics.IncPingFailure()
@@ -169,23 +169,23 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 	if contentType == "" {
 		contentType = detectContentTypeFromFile(localPath)
 	}
-	storagePath := h.binaryPath(fileID)
+	storagePath := h.documentPath(fileID)
 
 	_, err = h.client.UploadFile(r.Context(), storagePath, "file", fh.Filename, localPath)
 	if err != nil {
-		h.metrics.IncSeaweedConnectionFail()
-		h.metrics.IncSeaweedUploadFail(h.bucketName())
+		h.metrics.IncHitachiConnectionFail()
+		h.metrics.IncHitachiUploadFail(h.bucketName())
 		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "errorCode": 2, "message": err.Error(), "data": map[string]any{"cid": fileID}})
 		return
 	}
-	h.metrics.IncSeaweedUploadSuccess(h.bucketName())
+	h.metrics.IncHitachiUploadSuccess(h.bucketName())
 
-	meta := seaweed.FileMeta{FileID: fileID, TenantID: tenantID, StoragePath: storagePath, Size: size, ContentType: contentType, UploadedAt: time.Now().UTC(), Tags: map[string]string{"tenant_id": tenantID, "original_filename": fh.Filename}}
+	meta := storage.FileMeta{FileID: fileID, TenantID: tenantID, StoragePath: storagePath, Size: size, ContentType: contentType, UploadedAt: time.Now().UTC(), Tags: map[string]string{"tenant_id": tenantID, "original_filename": fh.Filename}}
 
 	if err := h.client.UploadJSON(r.Context(), h.metaPath(fileID), meta); err != nil {
-		h.metrics.IncSeaweedConnectionFail()
-		h.metrics.IncSeaweedUploadFail(h.bucketName())
+		h.metrics.IncHitachiConnectionFail()
+		h.metrics.IncHitachiUploadFail(h.bucketName())
 		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
 		payload := map[string]any{"error": true, "errorCode": 3, "message": err.Error(), "data": map[string]any{"cid": fileID}}
 		if failedPath, moveErr := h.moveBinaryToFailed(r.Context(), fileID, fh.Filename, localPath); moveErr == nil {
@@ -196,7 +196,7 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		writeJSON(w, http.StatusBadGateway, payload)
 		return
 	}
-	h.metrics.IncSeaweedUploadSuccess(h.bucketName())
+	h.metrics.IncHitachiUploadSuccess(h.bucketName())
 	h.metrics.IncFileUploadSuccess(h.bucketName())
 	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID}})
 }
@@ -242,7 +242,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
 
 	if err != nil {
-		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncGetStatsFail(h.bucketName(), fileID)
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
 		return
@@ -255,21 +255,21 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
 	if err != nil {
-		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
 		return
 	}
 	resp, err := h.client.Download(r.Context(), meta.StoragePath)
 	if err != nil {
-		h.metrics.IncSeaweedConnectionFail()
-		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+		h.metrics.IncHitachiConnectionFail()
+		h.metrics.IncHitachiGetStreamFail(h.bucketName(), meta.StoragePath)
 		h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
 		return
 	}
 	defer resp.Body.Close()
-	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+	h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
 	h.metrics.IncFileDownloadSuccess(h.bucketName())
 	if meta.ContentType != "" {
 		w.Header().Set("Content-Type", meta.ContentType)
@@ -445,7 +445,7 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	// =======================
 	meta, err := h.readMeta(r.Context(), fileID)
 	if err != nil {
-		h.metrics.IncSeaweedConnectionFail()
+		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": true, "message": err.Error(),
@@ -483,8 +483,8 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	if isImage {
 		resp, err := h.client.Download(r.Context(), meta.StoragePath)
 		if err != nil {
-			h.metrics.IncSeaweedConnectionFail()
-			h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+			h.metrics.IncHitachiConnectionFail()
+			h.metrics.IncHitachiGetStreamFail(h.bucketName(), meta.StoragePath)
 			h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
 
 			writeJSON(w, http.StatusBadGateway, map[string]any{
@@ -494,7 +494,7 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		}
 		defer resp.Body.Close()
 
-		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+		h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
 		h.metrics.IncFileDownloadSuccess(h.bucketName())
 
 		w.Header().Set("Content-Type", contentType)
@@ -529,9 +529,8 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	cachePath := h.previewCachePath(fileID, page, dpi)
 
 	if resp, err := h.client.Download(r.Context(), cachePath); err == nil {
-		defer resp.Body.Close()
-
-		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+		defer resp.Close()
+		h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
 		h.metrics.IncPDFImageSuccess(h.bucketName())
 
 		if size := resp.ContentLength; size > 0 {
@@ -562,8 +561,8 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
 
 	if err := h.client.DownloadToFile(r.Context(), meta.StoragePath, pdfPath); err != nil {
-		h.metrics.IncSeaweedConnectionFail()
-		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
+		h.metrics.IncHitachiConnectionFail()
+		h.metrics.IncHitachiGetStreamFail(h.bucketName(), meta.StoragePath)
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
 
 		writeJSON(w, http.StatusBadGateway, map[string]any{
@@ -572,7 +571,7 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		return
 	}
 
-	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
+	h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
 
 	prefix := filepath.Join(tmpDir, "preview")
 
@@ -634,8 +633,8 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	_, _ = w.Write(pngBytes)
 }
 
-func (h *Handler) readMeta(ctx context.Context, fileID string) (seaweed.FileMeta, error) {
-	var meta seaweed.FileMeta
+func (h *Handler) readMeta(ctx context.Context, fileID string) (storage.FileMeta, error) {
+	var meta storage.FileMeta
 	if err := h.client.ReadJSON(ctx, h.metaPath(fileID), &meta); err != nil {
 		return meta, err
 	}
@@ -653,8 +652,8 @@ func (h *Handler) moveBinaryToFailed(ctx context.Context, fileID, fileName, loca
 	return failedPath, nil
 }
 
-func (h *Handler) binaryPath(fileID string) string {
-	return path.Join(h.cfg.InternalRoot, "data", fileID)
+func (h *Handler) documentPath(fileID string) string {
+	return path.Join(h.cfg.InternalRoot, "document", fileID)
 }
 
 func (h *Handler) failedBinaryPath(fileID, fileName string) string {
@@ -665,14 +664,18 @@ func (h *Handler) failedBinaryPath(fileID, fileName string) string {
 	return path.Join(h.cfg.InternalRoot, "failed", name)
 }
 
+func (h *Handler) binaryPath(fileID string) string {
+	return h.documentPath(fileID)
+}
+
 func (h *Handler) metaPath(fileID string) string {
 	return path.Join(h.cfg.InternalRoot, "meta", fileID+".json")
 }
 func (h *Handler) previewCachePath(fileID string, page, dpi int) string {
-	return path.Join(h.cfg.InternalRoot, "images", fmt.Sprintf("%s_page_%d_dpi_%d.png", fileID, page, dpi))
+	return path.Join(h.cfg.InternalRoot, "thumbnail", fmt.Sprintf("%s_page_%d_dpi_%d.png", fileID, page, dpi))
 }
 func (h *Handler) bucketName() string {
-	return h.cfg.InternalRoot
+	return h.cfg.HitachiBucket
 }
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
