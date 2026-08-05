@@ -186,37 +186,126 @@ Optional:
 ## Build
 
 ```bash
+cd /home/cdit/dms-hitachi-connector
 go build -o bin/dms-hitachi-connector ./cmd/server
 ```
 
-## Test
+## Configuration
 
-There are no Go unit tests in the repo right now, so the main verification flow is:
+Required environment variables:
 
-1. Build the binary
-2. Ensure your Hitachi-compatible storage endpoint is available
-3. Run the connector
-4. Run the smoke test
+- `HITACHI_ENDPOINT=https://<your-s3-endpoint>`
+- `HITACHI_ACCESS_KEY_ID=<access-key>`
+- `HITACHI_SECRET_ACCESS_KEY=<secret-key>`
+- `HITACHI_BUCKET=<bucket-name>`
+
+Optional environment variables:
+
+- `LISTEN_ADDR=:9082`
+- `READ_TIMEOUT=30s`
+- `WRITE_TIMEOUT=5m`
+- `IDLE_TIMEOUT=60s`
+- `HITACHI_OBJECT_PREFIX=/connector/dms`
+- `HITACHI_HTTP_TIMEOUT=60s`
+- `TEMP_DIR=/tmp`
+- `DOWNLOAD_CACHE_DIR=/tmp/dms-download-cache`
+- `DOWNLOAD_CACHE_MAX_FILES=128`
+- `MAX_UPLOAD_BYTES=67108864`
+- `PDF_RENDER_DPI=144`
+- `WORKER_ID=0`
+
+`WORKER_ID` must be unique per connector instance and must be in the range `0..1023`.
 
 ## Local Run
 
-Use `start-local.sh` to launch the connector against an existing local storage endpoint without Docker:
+This repository now assumes a separate Hitachi-compatible storage endpoint is already available.
+
+1. Build the connector:
+
+```bash
+cd /home/cdit/dms-hitachi-connector
+go build -o bin/dms-hitachi-connector ./cmd/server
+```
+
+2. Set required environment variables and start the server:
+
+```bash
+export HITACHI_ENDPOINT=http://127.0.0.1:9000
+export HITACHI_ACCESS_KEY_ID=minioadmin
+export HITACHI_SECRET_ACCESS_KEY=minioadmin
+export HITACHI_BUCKET=dms-connector
+export HITACHI_OBJECT_PREFIX=/connector/dms
+export WORKER_ID=0
+export LISTEN_ADDR=":9081"
+
+./bin/dms-hitachi-connector
+```
+
+Or use the helper script:
 
 ```bash
 ./start-local.sh
 ```
 
-Build:
+## Test / API Check Steps
+
+Use the connector endpoints to verify the service.
+
+### Health checks
 
 ```bash
-go build -o bin/dms-hitachi-connector ./cmd/server
+curl http://127.0.0.1:9081/healthz
+curl http://127.0.0.1:9081/readyz
+curl http://127.0.0.1:9081/dss/api/ping
 ```
 
-Start the local Hitachi-compatible stack:
+### Upload a test file
 
 ```bash
-# Start your local Hitachi-compatible service here
+curl -X PUT --data-binary @sample.pdf http://127.0.0.1:9081/dss/api/put/test-tenant
 ```
+
+If you do not have a sample file, run the included smoke test script instead:
+
+```bash
+BASE_URL=http://127.0.0.1:9081 examples/curl-smoke-test.sh
+```
+
+### Get metadata / stats
+
+```bash
+curl http://127.0.0.1:9081/dss/api/stats/<file_id>
+```
+
+### Download the uploaded file
+
+```bash
+curl -v http://127.0.0.1:9081/dss/api/get/<file_id> -o downloaded.bin
+```
+
+### Get image or PDF preview
+
+```bash
+curl -v "http://127.0.0.1:9081/dss/api/getimage/<file_id>/1?scale=1.0" -o preview.png
+```
+
+### Metrics
+
+```bash
+curl http://127.0.0.1:9081/metrics | grep dms_connector_requests_total
+```
+
+## Verification flow
+
+1. Build the binary
+2. Make sure your Hitachi-compatible storage endpoint is running
+3. Start the connector
+4. Run health and ping checks
+5. Upload a file
+6. Fetch stats for the uploaded file
+7. Download the file
+8. Request a preview image
+9. Inspect metrics
 
 Run the connector:
 
