@@ -21,6 +21,7 @@ type Config struct {
 	HitachiBucket             string
 	HitachiUsePathStyle       bool
 	HitachiInsecureSkipVerify bool
+	SkipStorageHealthCheck    bool
 	InternalRoot              string
 	HTTPTimeout               time.Duration
 	TempDir                   string
@@ -46,6 +47,7 @@ func Load() (Config, error) {
 		HitachiBucket:             getEnv("HITACHI_BUCKET", "dms-connector"),
 		HitachiUsePathStyle:       getBoolEnv("HITACHI_USE_PATH_STYLE", true),
 		HitachiInsecureSkipVerify: getBoolEnv("HITACHI_INSECURE_SKIP_VERIFY", false),
+		SkipStorageHealthCheck:    getBoolEnv("HITACHI_SKIP_STORAGE_HEALTH_CHECK", false),
 		InternalRoot:              strings.Trim(strings.TrimRight(getEnv("HITACHI_OBJECT_PREFIX", "/connector/dms"), "/"), "/"),
 		HTTPTimeout:               getDurationEnv("HITACHI_HTTP_TIMEOUT", 60*time.Second),
 		TempDir:                   tempDir,

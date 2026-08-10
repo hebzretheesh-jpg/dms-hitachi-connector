@@ -43,11 +43,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/dss/api/ping":
 		endpoint = "ping"
-		if err := h.client.Health(r.Context()); err != nil {
-			h.metrics.IncPingFailure()
-			h.metrics.IncHitachiConnectionFail()
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
-		} else if err := h.idGen.HealthError(); err != nil {
+		if !h.cfg.SkipStorageHealthCheck {
+			if err := h.client.Health(r.Context()); err != nil {
+				h.metrics.IncPingFailure()
+				h.metrics.IncHitachiConnectionFail()
+				writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+				break
+			}
+		}
+		if err := h.idGen.HealthError(); err != nil {
 			h.metrics.IncPingFailure()
 			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
 		} else {
@@ -63,11 +67,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusOK, map[string]any{"status": "ok"})
 	case r.Method == http.MethodGet && r.URL.Path == "/readyz":
 		endpoint = "readyz"
-		if err := h.client.Health(r.Context()); err != nil {
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
-		} else {
-			writeJSON(rw, http.StatusOK, map[string]any{"status": "ready"})
+		if !h.cfg.SkipStorageHealthCheck {
+			if err := h.client.Health(r.Context()); err != nil {
+				writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+				break
+			}
 		}
+		writeJSON(rw, http.StatusOK, map[string]any{"status": "ready"})
 	case matchMethods(r.Method, http.MethodGet, http.MethodPost, http.MethodPut) && strings.HasPrefix(r.URL.Path, "/dss/api/put/"):
 		endpoint = "put"
 		h.uploadBinaryData(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/put/"))
