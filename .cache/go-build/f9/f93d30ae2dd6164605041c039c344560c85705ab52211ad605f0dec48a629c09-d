@@ -1,0 +1,4 @@
+./cpuid.go
+./detect_intel.go
+./generate.go
+./cpuid_amd64.s

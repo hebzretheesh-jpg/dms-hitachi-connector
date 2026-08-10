@@ -35,6 +35,7 @@ func main() {
 		cfg.InternalRoot,
 		cfg.HitachiUsePathStyle,
 		cfg.HTTPTimeout,
+		cfg.HitachiInsecureSkipVerify,
 		cfg.DownloadCacheDir,
 		cfg.DownloadCacheMaxFiles,
 	)

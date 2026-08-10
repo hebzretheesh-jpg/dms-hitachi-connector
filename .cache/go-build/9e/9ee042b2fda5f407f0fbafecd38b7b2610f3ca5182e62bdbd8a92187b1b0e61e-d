@@ -1,0 +1,15 @@
+./cpuid.go
+./cpuid_amd64.go
+./sha256.go
+./sha256blockAvx2_amd64.go
+./sha256blockAvx512_amd64.go
+./sha256blockAvx_amd64.go
+./sha256blockSha_amd64.go
+./sha256blockSsse_amd64.go
+./sha256block_amd64.go
+./cpuid_amd64.s
+./sha256blockAvx2_amd64.s
+./sha256blockAvx512_amd64.s
+./sha256blockAvx_amd64.s
+./sha256blockSha_amd64.s
+./sha256blockSsse_amd64.s

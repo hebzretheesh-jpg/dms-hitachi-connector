@@ -141,18 +141,37 @@ type statusWriter struct {
 
 func (w *statusWriter) WriteHeader(code int) { w.status = code; w.ResponseWriter.WriteHeader(code) }
 func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenantID string) {
-	if err := r.ParseMultipartForm(h.cfg.MaxUploadBytes); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
-		return
-	}
-	f, fh, err := r.FormFile("bin")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
-		return
-	}
-	defer f.Close()
+	var (
+		src         io.Reader
+		filename    string
+		contentType string
+	)
 
-	localPath, size, err := h.stageUploadFile(f)
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+		if err := r.ParseMultipartForm(h.cfg.MaxUploadBytes); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+			return
+		}
+		f, fh, err := r.FormFile("bin")
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+			return
+		}
+		defer f.Close()
+		src = f
+		filename = fh.Filename
+		contentType = fh.Header.Get("Content-Type")
+	} else {
+		src = r.Body
+		defer r.Body.Close()
+		filename = r.Header.Get("X-Original-Filename")
+		if filename == "" {
+			filename = r.Header.Get("X-Filename")
+		}
+		contentType = r.Header.Get("Content-Type")
+	}
+
+	localPath, size, err := h.stageUploadFile(src)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
 		return
@@ -165,13 +184,19 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		return
 	}
 
-	contentType := fh.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = detectContentTypeFromFile(localPath)
 	}
+	if filename == "" {
+		filename = fileID
+		if ext := extensionFromContentType(contentType); ext != "" {
+			filename += ext
+		}
+	}
+
 	storagePath := h.documentPath(fileID)
 
-	_, err = h.client.UploadFile(r.Context(), storagePath, "file", fh.Filename, localPath)
+	_, err = h.client.UploadFile(r.Context(), storagePath, "file", filename, localPath)
 	if err != nil {
 		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncHitachiUploadFail(h.bucketName())
@@ -181,14 +206,14 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 	}
 	h.metrics.IncHitachiUploadSuccess(h.bucketName())
 
-	meta := storage.FileMeta{FileID: fileID, TenantID: tenantID, StoragePath: storagePath, Size: size, ContentType: contentType, UploadedAt: time.Now().UTC(), Tags: map[string]string{"tenant_id": tenantID, "original_filename": fh.Filename}}
+	meta := storage.FileMeta{FileID: fileID, TenantID: tenantID, StoragePath: storagePath, Size: size, ContentType: contentType, UploadedAt: time.Now().UTC(), Tags: map[string]string{"tenant_id": tenantID, "original_filename": filename}}
 
 	if err := h.client.UploadJSON(r.Context(), h.metaPath(fileID), meta); err != nil {
 		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncHitachiUploadFail(h.bucketName())
 		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
 		payload := map[string]any{"error": true, "errorCode": 3, "message": err.Error(), "data": map[string]any{"cid": fileID}}
-		if failedPath, moveErr := h.moveBinaryToFailed(r.Context(), fileID, fh.Filename, localPath); moveErr == nil {
+		if failedPath, moveErr := h.moveBinaryToFailed(r.Context(), fileID, filename, localPath); moveErr == nil {
 			payload["data"].(map[string]any)["failed_path"] = failedPath
 		} else {
 			payload["data"].(map[string]any)["move_failed_error"] = moveErr.Error()

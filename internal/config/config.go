@@ -10,48 +10,50 @@ import (
 )
 
 type Config struct {
-	ListenAddr             string
-	ReadTimeout            time.Duration
-	WriteTimeout           time.Duration
-	IdleTimeout            time.Duration
-	HitachiEndpoint        string
-	HitachiAccessKeyID     string
-	HitachiSecretAccessKey string
-	HitachiRegion          string
-	HitachiBucket          string
-	HitachiUsePathStyle    bool
-	InternalRoot           string
-	HTTPTimeout            time.Duration
-	TempDir                string
-	DownloadCacheDir       string
-	DownloadCacheMaxFiles  int
-	MaxUploadBytes         int64
-	PDFFallbackDPI         int
-	WorkerID               int
+	ListenAddr                string
+	ReadTimeout               time.Duration
+	WriteTimeout              time.Duration
+	IdleTimeout               time.Duration
+	HitachiEndpoint           string
+	HitachiAccessKeyID        string
+	HitachiSecretAccessKey    string
+	HitachiRegion             string
+	HitachiBucket             string
+	HitachiUsePathStyle       bool
+	HitachiInsecureSkipVerify bool
+	InternalRoot              string
+	HTTPTimeout               time.Duration
+	TempDir                   string
+	DownloadCacheDir          string
+	DownloadCacheMaxFiles     int
+	MaxUploadBytes            int64
+	PDFFallbackDPI            int
+	WorkerID                  int
 }
 
 func Load() (Config, error) {
 	tempDir := getEnv("TEMP_DIR", os.TempDir())
 
 	cfg := Config{
-		ListenAddr:             getEnv("LISTEN_ADDR", ":9082"),
-		ReadTimeout:            getDurationEnv("READ_TIMEOUT", 30*time.Second),
-		WriteTimeout:           getDurationEnv("WRITE_TIMEOUT", 5*time.Minute),
-		IdleTimeout:            getDurationEnv("IDLE_TIMEOUT", 60*time.Second),
-		HitachiEndpoint:        getEnv("HITACHI_ENDPOINT", ""),
-		HitachiAccessKeyID:     getEnv("HITACHI_ACCESS_KEY_ID", ""),
-		HitachiSecretAccessKey: getEnv("HITACHI_SECRET_ACCESS_KEY", ""),
-		HitachiRegion:          getEnv("HITACHI_REGION", "us-east-1"),
-		HitachiBucket:          getEnv("HITACHI_BUCKET", "dms-connector"),
-		HitachiUsePathStyle:    getBoolEnv("HITACHI_USE_PATH_STYLE", true),
-		InternalRoot:           strings.Trim(strings.TrimRight(getEnv("HITACHI_OBJECT_PREFIX", "/connector/dms"), "/"), "/"),
-		HTTPTimeout:            getDurationEnv("HITACHI_HTTP_TIMEOUT", 60*time.Second),
-		TempDir:                tempDir,
-		DownloadCacheDir:       getEnv("DOWNLOAD_CACHE_DIR", filepath.Join(tempDir, "dms-download-cache")),
-		DownloadCacheMaxFiles:  getIntEnv("DOWNLOAD_CACHE_MAX_FILES", 128),
-		MaxUploadBytes:         getInt64Env("MAX_UPLOAD_BYTES", 64<<20),
-		PDFFallbackDPI:         getIntEnv("PDF_RENDER_DPI", 144),
-		WorkerID:               getIntEnv("WORKER_ID", 0),
+		ListenAddr:                getEnv("LISTEN_ADDR", ":9082"),
+		ReadTimeout:               getDurationEnv("READ_TIMEOUT", 30*time.Second),
+		WriteTimeout:              getDurationEnv("WRITE_TIMEOUT", 5*time.Minute),
+		IdleTimeout:               getDurationEnv("IDLE_TIMEOUT", 60*time.Second),
+		HitachiEndpoint:           getEnv("HITACHI_ENDPOINT", ""),
+		HitachiAccessKeyID:        getEnv("HITACHI_ACCESS_KEY_ID", ""),
+		HitachiSecretAccessKey:    getEnv("HITACHI_SECRET_ACCESS_KEY", ""),
+		HitachiRegion:             getEnv("HITACHI_REGION", "us-east-1"),
+		HitachiBucket:             getEnv("HITACHI_BUCKET", "dms-connector"),
+		HitachiUsePathStyle:       getBoolEnv("HITACHI_USE_PATH_STYLE", true),
+		HitachiInsecureSkipVerify: getBoolEnv("HITACHI_INSECURE_SKIP_VERIFY", false),
+		InternalRoot:              strings.Trim(strings.TrimRight(getEnv("HITACHI_OBJECT_PREFIX", "/connector/dms"), "/"), "/"),
+		HTTPTimeout:               getDurationEnv("HITACHI_HTTP_TIMEOUT", 60*time.Second),
+		TempDir:                   tempDir,
+		DownloadCacheDir:          getEnv("DOWNLOAD_CACHE_DIR", filepath.Join(tempDir, "dms-download-cache")),
+		DownloadCacheMaxFiles:     getIntEnv("DOWNLOAD_CACHE_MAX_FILES", 128),
+		MaxUploadBytes:            getInt64Env("MAX_UPLOAD_BYTES", 64<<20),
+		PDFFallbackDPI:            getIntEnv("PDF_RENDER_DPI", 144),
+		WorkerID:                  getIntEnv("WORKER_ID", 0),
 	}
 
 	if cfg.HitachiEndpoint == "" {

@@ -3,10 +3,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,7 +51,7 @@ func (dr *DownloadResponse) Close() error {
 	return dr.Body.Close()
 }
 
-func NewClient(endpoint, accessKey, secretKey, region, bucket, prefix string, usePathStyle bool, timeout time.Duration, cacheDir string, cacheMaxFiles int) (*Client, error) {
+func NewClient(endpoint, accessKey, secretKey, region, bucket, prefix string, usePathStyle bool, timeout time.Duration, insecureSkipVerify bool, cacheDir string, cacheMaxFiles int) (*Client, error) {
 	cache, err := newDownloadCache(cacheDir, cacheMaxFiles)
 	if err != nil {
 		return nil, err
@@ -72,11 +74,24 @@ func NewClient(endpoint, accessKey, secretKey, region, bucket, prefix string, us
 		bucketLookup = minio.BucketLookupPath
 	}
 
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: insecureSkipVerify,
+		},
+		DialContext: (&net.Dialer{
+			Timeout: timeout,
+		}).DialContext,
+		IdleConnTimeout:       timeout,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
+
 	minioClient, err := minio.New(parsedEndpoint, &minio.Options{
 		Creds:        credentials.NewStaticV4(accessKey, secretKey, ""),
 		Region:       region,
 		Secure:       secure,
-		Transport:    &http.Transport{Proxy: http.ProxyFromEnvironment},
+		Transport:    transport,
 		BucketLookup: bucketLookup,
 	})
 	if err != nil {
