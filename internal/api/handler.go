@@ -41,6 +41,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rw := &statusWriter{ResponseWriter: w, status: 200}
 	endpoint := "unknown"
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/":
+		endpoint = "root"
+		writeJSON(rw, http.StatusOK, map[string]any{"status": "ok", "endpoints": []string{"/dss/api/ping", "/metrics", "/healthz"}})
+
 	case r.Method == http.MethodGet && r.URL.Path == "/dss/api/ping":
 		endpoint = "ping"
 		if !h.cfg.SkipStorageHealthCheck {
@@ -192,6 +196,10 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 
 	if contentType == "" {
 		contentType = detectContentTypeFromFile(localPath)
+	} else if contentType == "application/x-www-form-urlencoded" || contentType == "text/plain" {
+		if detected := detectContentTypeFromFile(localPath); detected != "" {
+			contentType = detected
+		}
 	}
 	if filename == "" {
 		filename = fileID
@@ -279,9 +287,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 		return
 	}
 	h.metrics.IncGetStatsSuccess(h.bucketName())
-	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID, "tenant_id": meta.TenantID, "deleted": "false", "content_status": "PROCESSED", "mime_type": meta.ContentType, "page_count": "1", "name": fileID + ".pdf"}})
-	//writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID}})
-	//writeJSON(w, http.StatusOK, map[string]any{"error": false, "data": meta})
+	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": meta})
 }
 func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
@@ -487,24 +493,26 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	// =======================
 	// NORMALIZE TYPE
 	// =======================
-	contentType := strings.ToLower(meta.ContentType)
+	contentType := strings.ToLower(strings.TrimSpace(meta.ContentType))
 
-	fileName := strings.ToLower(meta.Tags["original_filename"])
+	fileName := strings.ToLower(strings.TrimSpace(meta.Tags["original_filename"]))
 	if fileName == "" {
 		fileName = strings.ToLower(fileID + ".pdf") // fallback
 	}
+	fileExt := strings.ToLower(filepath.Ext(fileName))
 
 	// detect types
 	isImage := strings.HasPrefix(contentType, "image/") ||
-		strings.HasSuffix(fileName, ".png") ||
-		strings.HasSuffix(fileName, ".jpg") ||
-		strings.HasSuffix(fileName, ".jpeg")
+		fileExt == ".png" ||
+		fileExt == ".jpg" ||
+		fileExt == ".jpeg" ||
+		fileExt == ".gif"
 
-	isPDF := strings.Contains(contentType, "pdf") ||
-		strings.HasSuffix(fileName, ".pdf")
+	isPDF := strings.Contains(contentType, "pdf") || fileExt == ".pdf"
 
-	// fix DSS wrong MIME
-	if contentType == "application/octet-stream" && isPDF {
+	// fix wrong MIME for PDF uploads
+	if !isPDF && (contentType == "application/octet-stream" || strings.Contains(contentType, "x-www-form-urlencoded") || strings.Contains(contentType, "text/plain")) && fileExt == ".pdf" {
+		isPDF = true
 		contentType = "application/pdf"
 	}
 
