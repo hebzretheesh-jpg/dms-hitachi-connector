@@ -159,87 +159,332 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
 		if err := r.ParseMultipartForm(h.cfg.MaxUploadBytes); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "The provided data does not match the expected format",
+			})
 			return
 		}
+
 		f, fh, err := r.FormFile("bin")
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
-			return
+			// fallback: if client used a different field name,
+			// pick the first file available
+			if r.MultipartForm != nil {
+				found := false
+
+				for _, files := range r.MultipartForm.File {
+					if len(files) == 0 {
+						continue
+					}
+
+					fh = files[0]
+					f, err = fh.Open()
+
+					if err == nil {
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					writeJSON(w, http.StatusBadRequest, map[string]any{
+						"error": "The provided data does not match the expected format",
+					})
+					return
+				}
+			} else {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "The provided data does not match the expected format",
+				})
+				return
+			}
 		}
+
 		defer f.Close()
+
 		src = f
 		filename = fh.Filename
 		contentType = fh.Header.Get("Content-Type")
+
 	} else {
+
 		src = r.Body
 		defer r.Body.Close()
+
 		filename = r.Header.Get("X-Original-Filename")
+
 		if filename == "" {
 			filename = r.Header.Get("X-Filename")
 		}
+
 		contentType = r.Header.Get("Content-Type")
 	}
 
+	// ============================================================
+	// STAGE UPLOAD FILE
+	// ============================================================
+
 	localPath, size, err := h.stageUploadFile(src)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "The provided data does not match the expected format"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "The provided data does not match the expected format",
+		})
 		return
 	}
+
 	defer os.Remove(localPath)
 
-	fileID, err := h.idGen.Generate()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": true, "errorCode": 1, "message": err.Error()})
-		return
+	// ============================================================
+	// PRESERVE OLD DSS CID DURING MIGRATION
+	//
+	// Migration service sends:
+	//
+	// X-Source-CID: 12345
+	//
+	// If this header is present, use the old DSS CID as the
+	// new Hitachi file ID.
+	//
+	// If this header is not present, keep the existing behavior
+	// and generate a new file ID.
+	// ============================================================
+
+	sourceCID := strings.TrimSpace(
+		r.Header.Get("X-Source-CID"),
+	)
+
+	var fileID string
+
+	if sourceCID != "" {
+
+		// Validate that CID is numeric.
+		if _, err := strconv.ParseInt(
+			sourceCID,
+			10,
+			64,
+		); err != nil {
+
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":     true,
+				"errorCode": 1,
+				"message":   "invalid X-Source-CID",
+			})
+
+			return
+		}
+
+		// IMPORTANT:
+		// Preserve old DSS CID.
+		fileID = sourceCID
+
+		fmt.Printf(
+			"Migration upload: preserving old DSS CID as Hitachi fileID=%s\n",
+			fileID,
+		)
+
+	} else {
+
+		// ========================================================
+		// NORMAL EXISTING UPLOAD
+		//
+		// No old CID supplied.
+		// Generate a new ID exactly as before.
+		// ========================================================
+
+		generatedFileID, err := h.idGen.Generate()
+		if err != nil {
+
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":     true,
+				"errorCode": 1,
+				"message":   err.Error(),
+			})
+
+			return
+		}
+
+		fileID = generatedFileID
 	}
 
+	// ============================================================
+	// CONTENT TYPE
+	// ============================================================
+
 	if contentType == "" {
+
 		contentType = detectContentTypeFromFile(localPath)
-	} else if contentType == "application/x-www-form-urlencoded" || contentType == "text/plain" {
+
+	} else if contentType == "application/x-www-form-urlencoded" ||
+		contentType == "text/plain" {
+
 		if detected := detectContentTypeFromFile(localPath); detected != "" {
 			contentType = detected
 		}
 	}
+
+	// ============================================================
+	// FILE NAME
+	// ============================================================
+
 	if filename == "" {
+
 		filename = fileID
+
 		if ext := extensionFromContentType(contentType); ext != "" {
 			filename += ext
 		}
 	}
 
+	// ============================================================
+	// HITACHI STORAGE PATH
+	//
+	// Example:
+	//
+	// Old CID = 12345
+	//
+	// document/12345
+	// ============================================================
+
 	storagePath := h.documentPath(fileID)
 
-	_, err = h.client.UploadFile(r.Context(), storagePath, "file", filename, localPath)
+	// ============================================================
+	// UPLOAD FILE
+	// ============================================================
+
+	_, err = h.client.UploadFile(
+		r.Context(),
+		storagePath,
+		"file",
+		filename,
+		localPath,
+	)
+
 	if err != nil {
+
 		h.metrics.IncHitachiConnectionFail()
-		h.metrics.IncHitachiUploadFail(h.bucketName())
-		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "errorCode": 2, "message": err.Error(), "data": map[string]any{"cid": fileID}})
+		h.metrics.IncHitachiUploadFail(
+			h.bucketName(),
+		)
+		h.metrics.IncFileUploadFail(
+			h.bucketName(),
+			fileID,
+		)
+
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error":     true,
+			"errorCode": 2,
+			"message":   err.Error(),
+			"data": map[string]any{
+				"cid": fileID,
+			},
+		})
+
 		return
 	}
-	h.metrics.IncHitachiUploadSuccess(h.bucketName())
 
-	meta := storage.FileMeta{FileID: fileID, TenantID: tenantID, StoragePath: storagePath, Size: size, ContentType: contentType, UploadedAt: time.Now().UTC(), Tags: map[string]string{"tenant_id": tenantID, "original_filename": filename}}
+	h.metrics.IncHitachiUploadSuccess(
+		h.bucketName(),
+	)
 
-	if err := h.client.UploadJSON(r.Context(), h.metaPath(fileID), meta); err != nil {
+	// ============================================================
+	// CREATE METADATA
+	// ============================================================
+
+	meta := storage.FileMeta{
+		FileID:      fileID,
+		TenantID:    tenantID,
+		StoragePath: storagePath,
+		Size:        size,
+		ContentType: contentType,
+		UploadedAt:  time.Now().UTC(),
+
+		Tags: map[string]string{
+			"tenant_id":         tenantID,
+			"original_filename": filename,
+		},
+	}
+
+	// ============================================================
+	// SAVE METADATA
+	//
+	// Example:
+	//
+	// meta/12345.json
+	// ============================================================
+
+	if err := h.client.UploadJSON(
+		r.Context(),
+		h.metaPath(fileID),
+		meta,
+	); err != nil {
+
 		h.metrics.IncHitachiConnectionFail()
-		h.metrics.IncHitachiUploadFail(h.bucketName())
-		h.metrics.IncFileUploadFail(h.bucketName(), fileID)
-		payload := map[string]any{"error": true, "errorCode": 3, "message": err.Error(), "data": map[string]any{"cid": fileID}}
-		if failedPath, moveErr := h.moveBinaryToFailed(r.Context(), fileID, filename, localPath); moveErr == nil {
-			payload["data"].(map[string]any)["failed_path"] = failedPath
-		} else {
-			payload["data"].(map[string]any)["move_failed_error"] = moveErr.Error()
+		h.metrics.IncHitachiUploadFail(
+			h.bucketName(),
+		)
+		h.metrics.IncFileUploadFail(
+			h.bucketName(),
+			fileID,
+		)
+
+		payload := map[string]any{
+			"error":     true,
+			"errorCode": 3,
+			"message":   err.Error(),
+			"data": map[string]any{
+				"cid": fileID,
+			},
 		}
-		writeJSON(w, http.StatusBadGateway, payload)
+
+		if failedPath, moveErr := h.moveBinaryToFailed(
+			r.Context(),
+			fileID,
+			filename,
+			localPath,
+		); moveErr == nil {
+
+			payload["data"].(map[string]any)["failed_path"] = failedPath
+
+		} else {
+
+			payload["data"].(map[string]any)["move_failed_error"] =
+				moveErr.Error()
+		}
+
+		writeJSON(
+			w,
+			http.StatusBadGateway,
+			payload,
+		)
+
 		return
 	}
-	h.metrics.IncHitachiUploadSuccess(h.bucketName())
-	h.metrics.IncFileUploadSuccess(h.bucketName())
-	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": map[string]any{"cid": fileID}})
-}
 
+	// ============================================================
+	// SUCCESS METRICS
+	// ============================================================
+
+	h.metrics.IncHitachiUploadSuccess(
+		h.bucketName(),
+	)
+
+	h.metrics.IncFileUploadSuccess(
+		h.bucketName(),
+	)
+
+	// ============================================================
+	// RESPONSE
+	//
+	// Returns the SAME old CID when migration sends X-Source-CID.
+	// ============================================================
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"error":     false,
+		"errorCode": 0,
+		"data": map[string]any{
+			"cid": fileID,
+		},
+	})
+}
 func (h *Handler) stageUploadFile(src io.Reader) (string, int64, error) {
 	tmpFile, err := os.CreateTemp(h.cfg.TempDir, "dms-upload-*")
 	if err != nil {

@@ -27,14 +27,80 @@ type Client struct {
 	cache  *downloadCache
 }
 
+type Tags map[string]string
+
+// MarshalJSON encodes Tags as a JSON string containing the serialized object.
+// This is required for compatibility with the legacy Java DSS client,
+// which expects the "tags" field to be a String rather than a JSON object.
+func (t Tags) MarshalJSON() ([]byte, error) {
+	if t == nil {
+		return json.Marshal("")
+	}
+
+	b, err := json.Marshal(map[string]string(t))
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(string(b))
+}
+
+// UnmarshalJSON accepts either:
+//  1. a JSON object
+//  2. a JSON string containing a serialized JSON object
+//
+// This allows the connector to read both existing metadata and
+// metadata written using the legacy-compatible string representation.
+func (t *Tags) UnmarshalJSON(data []byte) error {
+	if t == nil {
+		return fmt.Errorf("nil receiver")
+	}
+
+	// null
+	if len(data) == 0 || string(data) == "null" {
+		*t = nil
+		return nil
+	}
+
+	// JSON string containing serialized JSON object
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+
+		if s == "" {
+			*t = map[string]string{}
+			return nil
+		}
+
+		var m map[string]string
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			return err
+		}
+
+		*t = m
+		return nil
+	}
+
+	// JSON object
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+
+	*t = m
+	return nil
+}
+
 type FileMeta struct {
-	FileID      string            `json:"file_id"`
-	TenantID    string            `json:"tenant_id"`
-	StoragePath string            `json:"storage_path"`
-	Size        int64             `json:"size"`
-	ContentType string            `json:"content_type"`
-	UploadedAt  time.Time         `json:"uploaded_at"`
-	Tags        map[string]string `json:"tags,omitempty"`
+	FileID      string    `json:"file_id"`
+	TenantID    string    `json:"tenant_id"`
+	StoragePath string    `json:"storage_path"`
+	Size        int64     `json:"size"`
+	ContentType string    `json:"content_type"`
+	UploadedAt  time.Time `json:"uploaded_at"`
+	Tags        Tags      `json:"tags,omitempty"`
 }
 
 type UploadResponse struct {
@@ -66,6 +132,7 @@ func NewClient(endpoint, accessKey, secretKey, region, bucket, prefix string, us
 		if err != nil {
 			return nil, err
 		}
+
 		parsedEndpoint = u.Host
 		secure = u.Scheme == "https"
 	}
@@ -94,13 +161,14 @@ func NewClient(endpoint, accessKey, secretKey, region, bucket, prefix string, us
 		Transport:    transport,
 		BucketLookup: bucketLookup,
 	})
+
 	if err != nil {
 		return nil, err
 	}
 
 	return &Client{
 		client: minioClient,
-		bucket: bucket,
+		bucket: strings.TrimSpace(bucket),
 		prefix: strings.Trim(strings.Trim(prefix, "/"), "/"),
 		cache:  cache,
 	}, nil
@@ -111,35 +179,57 @@ func (c *Client) Health(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	if !exists {
 		return fmt.Errorf("bucket %s does not exist", c.bucket)
 	}
+
 	return nil
 }
 
 func (c *Client) objectKey(objectPath string) string {
 	cleaned := strings.Trim(objectPath, "/")
+
 	if c.prefix == "" {
 		return cleaned
 	}
+
 	return path.Join(c.prefix, cleaned)
 }
 
 func (c *Client) UploadBytes(ctx context.Context, filerPath, fieldName, fileName string, payload []byte) (*UploadResponse, error) {
 	objectKey := c.objectKey(filerPath)
 	reader := bytes.NewReader(payload)
-	contentType := mime.TypeByExtension(path.Ext(fileName))
 
-	n, err := c.client.PutObject(ctx, c.bucket, objectKey, reader, int64(reader.Len()), minio.PutObjectOptions{ContentType: contentType})
+	contentType := mime.TypeByExtension(path.Ext(fileName))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	n, err := c.client.PutObject(
+		ctx,
+		c.bucket,
+		objectKey,
+		reader,
+		int64(reader.Len()),
+		minio.PutObjectOptions{
+			ContentType: contentType,
+		},
+	)
+
 	if err != nil {
 		return nil, err
 	}
 
-	return &UploadResponse{Name: n.Key, Size: n.Size}, nil
+	return &UploadResponse{
+		Name: n.Key,
+		Size: n.Size,
+	}, nil
 }
 
 func (c *Client) UploadFile(ctx context.Context, filerPath, fieldName, fileName, localPath string) (*UploadResponse, error) {
 	objectKey := c.objectKey(filerPath)
+
 	file, err := os.Open(localPath)
 	if err != nil {
 		return nil, err
@@ -152,13 +242,29 @@ func (c *Client) UploadFile(ctx context.Context, filerPath, fieldName, fileName,
 	}
 
 	contentType := mime.TypeByExtension(path.Ext(fileName))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 
-	n, err := c.client.PutObject(ctx, c.bucket, objectKey, file, stat.Size(), minio.PutObjectOptions{ContentType: contentType})
+	n, err := c.client.PutObject(
+		ctx,
+		c.bucket,
+		objectKey,
+		file,
+		stat.Size(),
+		minio.PutObjectOptions{
+			ContentType: contentType,
+		},
+	)
+
 	if err != nil {
 		return nil, err
 	}
 
-	return &UploadResponse{Name: n.Key, Size: n.Size}, nil
+	return &UploadResponse{
+		Name: n.Key,
+		Size: n.Size,
+	}, nil
 }
 
 func (c *Client) UploadJSON(ctx context.Context, filerPath string, v any) error {
@@ -169,18 +275,42 @@ func (c *Client) UploadJSON(ctx context.Context, filerPath string, v any) error 
 
 	objectKey := c.objectKey(filerPath)
 	reader := bytes.NewReader(b)
-	_, err = c.client.PutObject(ctx, c.bucket, objectKey, reader, int64(reader.Len()), minio.PutObjectOptions{ContentType: "application/json"})
+
+	_, err = c.client.PutObject(
+		ctx,
+		c.bucket,
+		objectKey,
+		reader,
+		int64(reader.Len()),
+		minio.PutObjectOptions{
+			ContentType: "application/json",
+		},
+	)
+
 	return err
 }
 
 func (c *Client) Delete(ctx context.Context, filerPath string) error {
 	objectKey := c.objectKey(filerPath)
-	return c.client.RemoveObject(ctx, c.bucket, objectKey, minio.RemoveObjectOptions{})
+
+	return c.client.RemoveObject(
+		ctx,
+		c.bucket,
+		objectKey,
+		minio.RemoveObjectOptions{},
+	)
 }
 
 func (c *Client) Download(ctx context.Context, filerPath string) (*DownloadResponse, error) {
 	objectKey := c.objectKey(filerPath)
-	obj, err := c.client.GetObject(ctx, c.bucket, objectKey, minio.GetObjectOptions{})
+
+	obj, err := c.client.GetObject(
+		ctx,
+		c.bucket,
+		objectKey,
+		minio.GetObjectOptions{},
+	)
+
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +321,10 @@ func (c *Client) Download(ctx context.Context, filerPath string) (*DownloadRespo
 		return nil, err
 	}
 
-	return &DownloadResponse{Body: obj, ContentLength: info.Size}, nil
+	return &DownloadResponse{
+		Body:          obj,
+		ContentLength: info.Size,
+	}, nil
 }
 
 func (c *Client) DownloadToFile(ctx context.Context, filerPath, localPath string) error {
@@ -199,9 +332,14 @@ func (c *Client) DownloadToFile(ctx context.Context, filerPath, localPath string
 		return c.downloadToFile(ctx, filerPath, localPath)
 	}
 
-	cachedPath, err := c.cache.GetOrCreate(ctx, filerPath, func(cachePath string) error {
-		return c.downloadToFile(ctx, filerPath, cachePath)
-	})
+	cachedPath, err := c.cache.GetOrCreate(
+		ctx,
+		filerPath,
+		func(cachePath string) error {
+			return c.downloadToFile(ctx, filerPath, cachePath)
+		},
+	)
+
 	if err != nil {
 		return err
 	}
@@ -223,6 +361,7 @@ func (c *Client) downloadToFile(ctx context.Context, filerPath, localPath string
 	defer f.Close()
 
 	_, err = io.Copy(f, dr.Body)
+
 	return err
 }
 
@@ -243,14 +382,24 @@ func (c *Client) ReadJSON(ctx context.Context, filerPath string, out any) error 
 
 func (c *Client) Exists(ctx context.Context, filerPath string) (bool, error) {
 	objectKey := c.objectKey(filerPath)
-	_, err := c.client.StatObject(ctx, c.bucket, objectKey, minio.StatObjectOptions{})
+
+	_, err := c.client.StatObject(
+		ctx,
+		c.bucket,
+		objectKey,
+		minio.StatObjectOptions{},
+	)
+
 	if err != nil {
 		respErr, ok := err.(minio.ErrorResponse)
+
 		if ok && respErr.StatusCode == http.StatusNotFound {
 			return false, nil
 		}
+
 		return false, err
 	}
+
 	return true, nil
 }
 
@@ -268,5 +417,6 @@ func copyFile(srcPath, dstPath string) error {
 	defer dst.Close()
 
 	_, err = io.Copy(dst, src)
+
 	return err
 }
