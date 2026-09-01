@@ -528,11 +528,29 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 	if err != nil {
 		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncGetStatsFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error":   true,
+			"message": err.Error(),
+		})
 		return
 	}
+
 	h.metrics.IncGetStatsSuccess(h.bucketName())
-	writeJSON(w, http.StatusOK, map[string]any{"error": false, "errorCode": 0, "data": meta})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"error":     false,
+		"errorCode": 0,
+		"data": map[string]any{
+			"cid":            fileID,
+			"tenant_id":      meta.TenantID,
+			"deleted":        "false",
+			"content_status": "PROCESSED",
+			"mime_type":      meta.ContentType,
+			"page_count":     "1",
+			"name":           fileID + ".pdf",
+		},
+	})
 }
 func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
