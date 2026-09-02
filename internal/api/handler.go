@@ -114,8 +114,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		page, err := strconv.Atoi(pageStr)
-		if err != nil {
-			page = 1 // fallback
+		if err != nil || page < 1 {
+			writeJSON(rw, http.StatusBadRequest, map[string]any{
+				"error": true, "message": "invalid page number",
+			})
+			break
 		}
 
 		h.getContentPreview(rw, r, fileID, page)
@@ -334,8 +337,13 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		}
 	}
 
-	// ============================================================
-	// HITACHI STORAGE PATH
+	// Detect PDF page count while the uploaded file is staged locally.
+	pageCount := 1
+	if isPDFContent(contentType, filename, localPath) {
+		if n, err := detectPDFPageCount(localPath); err == nil && n > 0 {
+			pageCount = n
+		}
+	}
 	//
 	// Example:
 	//
@@ -400,6 +408,7 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		Tags: map[string]string{
 			"tenant_id":         tenantID,
 			"original_filename": filename,
+			"page_count":        strconv.Itoa(pageCount),
 		},
 	}
 
@@ -460,6 +469,57 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 	}
 
 	// ============================================================
+	// PRE-WARM FIRST PDF PAGE CACHE
+	//
+	// Do this asynchronously so the upload API can return immediately.
+	// The local staged PDF cannot be used after this handler returns, so
+	// copy it to a private preview temp file before starting the goroutine.
+	//
+	// getimage still has the normal Hitachi-download fallback if Java asks
+	// for the preview before this background warm-up finishes.
+	// ============================================================
+	if pageCount > 0 && isPDFContent(contentType, filename, localPath) {
+		dpi := int(float64(h.cfg.PDFFallbackDPI))
+		if dpi < 72 {
+			dpi = 72
+		}
+		if dpi > 150 {
+			dpi = 150
+		}
+
+		previewSource, copyErr := copyPreviewSource(localPath, h.cfg.TempDir, fileID)
+		if copyErr != nil {
+			fmt.Printf("page-1 preview source copy failed for %s: %v\n", fileID, copyErr)
+		} else {
+			go func(sourcePath, id string, renderDPI int) {
+				defer os.Remove(sourcePath)
+
+				pngBytes, previewErr := h.generatePDFPreviewFromFile(
+					sourcePath,
+					id,
+					1,
+					renderDPI,
+				)
+				if previewErr != nil {
+					fmt.Printf("page-1 preview generation failed for %s: %v\n", id, previewErr)
+					return
+				}
+
+				cachePath := h.previewCachePath(id, 1, renderDPI)
+				if _, cacheErr := h.client.UploadBytes(
+					context.Background(),
+					cachePath,
+					"file",
+					path.Base(cachePath),
+					pngBytes,
+				); cacheErr != nil {
+					fmt.Printf("page-1 preview cache upload failed for %s: %v\n", id, cacheErr)
+				}
+			}(previewSource, fileID, dpi)
+		}
+	}
+
+	// ============================================================
 	// SUCCESS METRICS
 	// ============================================================
 
@@ -485,6 +545,32 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		},
 	})
 }
+func copyPreviewSource(sourcePath, tempDir, fileID string) (string, error) {
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+
+	dst, err := os.CreateTemp(tempDir, "dms-preview-source-"+fileID+"-*")
+	if err != nil {
+		return "", err
+	}
+
+	dstPath := dst.Name()
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(dstPath)
+		return "", err
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(dstPath)
+		return "", err
+	}
+
+	return dstPath, nil
+}
+
 func (h *Handler) stageUploadFile(src io.Reader) (string, int64, error) {
 	tmpFile, err := os.CreateTemp(h.cfg.TempDir, "dms-upload-*")
 	if err != nil {
@@ -521,6 +607,15 @@ func detectContentTypeFromFile(localPath string) string {
 	return http.DetectContentType(header[:n])
 }
 
+func pageCountFromMeta(meta storage.FileMeta) string {
+	if v := strings.TrimSpace(meta.Tags["page_count"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return strconv.Itoa(n)
+		}
+	}
+	return "1"
+}
+
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 	//_, err := h.readMeta(r.Context(), fileID)
 	meta, err := h.readMeta(r.Context(), fileID)
@@ -547,7 +642,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 			"deleted":        "false",
 			"content_status": "PROCESSED",
 			"mime_type":      meta.ContentType,
-			"page_count":     "1",
+			"page_count":     pageCountFromMeta(meta),
 			"name":           fileID + ".pdf",
 		},
 	})
@@ -584,105 +679,6 @@ func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID strin
 	}
 	_, _ = io.Copy(w, resp.Body)
 }
-
-// func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, fileID string, page int) {
-// 	scale := 1.0
-// 	if v := r.URL.Query().Get("scale"); v != "" {
-// 		if p, err := strconv.ParseFloat(v, 64); err == nil {
-// 			scale = p
-// 		}
-// 	}
-// 	if scale > 2 {
-// 		scale = 2
-// 	}
-// 	if scale <= 0 {
-// 		scale = 1
-// 	}
-// 	meta, err := h.readMeta(r.Context(), fileID)
-// 	if err != nil {
-// 		h.metrics.IncSeaweedConnectionFail()
-// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-// 		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
-// 		return
-// 	}
-// 	if strings.HasPrefix(strings.ToLower(meta.ContentType), "image/") {
-// 		resp, err := h.client.Download(r.Context(), meta.StoragePath)
-// 		if err != nil {
-// 			h.metrics.IncSeaweedConnectionFail()
-// 			h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
-// 			h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
-// 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
-// 			return
-// 		}
-// 		defer resp.Body.Close()
-// 		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
-// 		h.metrics.IncFileDownloadSuccess(h.bucketName())
-// 		w.Header().Set("Content-Type", meta.ContentType)
-// 		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", fileID+extensionFromContentType(meta.ContentType)))
-// 		if meta.Size > 0 {
-// 			w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
-// 		}
-// 		_, _ = io.Copy(w, resp.Body)
-// 		return
-// 	}
-// 	if !strings.Contains(strings.ToLower(meta.ContentType), "pdf") {
-// 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": true, "message": "preview only supported for PDF or image content"})
-// 		return
-// 	}
-// 	cachePath := h.previewCachePath(fileID, page)
-// 	if resp, err := h.client.Download(r.Context(), cachePath); err == nil {
-// 		defer resp.Body.Close()
-// 		h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
-// 		h.metrics.IncPDFImageSuccess(h.bucketName())
-// 		if size := resp.ContentLength; size > 0 {
-// 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-// 		}
-// 		w.Header().Set("Content-Type", "image/png")
-// 		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
-// 		_, _ = io.Copy(w, resp.Body)
-// 		return
-// 	}
-// 	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-")
-// 	if err != nil {
-// 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": true, "message": err.Error()})
-// 		return
-// 	}
-// 	defer os.RemoveAll(tmpDir)
-// 	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
-// 	if err := h.client.DownloadToFile(r.Context(), meta.StoragePath, pdfPath); err != nil {
-// 		h.metrics.IncSeaweedConnectionFail()
-// 		h.metrics.IncSeaweedGetStreamFail(h.bucketName(), meta.StoragePath)
-// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-// 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
-// 		return
-// 	}
-// 	h.metrics.IncSeaweedGetStreamSuccess(h.bucketName())
-// 	prefix := filepath.Join(tmpDir, "preview")
-// 	dpi := int(float64(h.cfg.PDFFallbackDPI) * scale)
-// 	cmd := exec.CommandContext(context.Background(), "pdftoppm", "-png", "-f", strconv.Itoa(page), "-singlefile", "-r", strconv.Itoa(dpi), pdfPath, prefix)
-// 	var stderr bytes.Buffer
-// 	cmd.Stderr = &stderr
-// 	if err := cmd.Run(); err != nil {
-// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-// 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": strings.TrimSpace(stderr.String())})
-// 		return
-// 	}
-// 	pngPath := prefix + ".png"
-// 	pngBytes, err := os.ReadFile(pngPath)
-// 	if err != nil {
-// 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-// 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": err.Error()})
-// 		return
-// 	}
-// 	h.metrics.IncPDFImageSuccess(h.bucketName())
-// 	go func(cachePath string, payload []byte) {
-// 		_, _ = h.client.UploadBytes(context.Background(), cachePath, "file", path.Base(cachePath), payload)
-// 	}(cachePath, append([]byte(nil), pngBytes...))
-// 	w.Header().Set("Content-Type", "image/png")
-// 	w.Header().Set("Content-Length", strconv.Itoa(len(pngBytes)))
-// 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
-// 	_, _ = w.Write(pngBytes)
-// }
 
 func (h *Handler) processFile(w http.ResponseWriter, r *http.Request, fileID string) {
 
@@ -764,6 +760,13 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	}
 	fileExt := strings.ToLower(filepath.Ext(fileName))
 
+	pageCount := 1
+	if v := strings.TrimSpace(meta.Tags["page_count"]); v != "" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil && n > 0 {
+			pageCount = n
+		}
+	}
+
 	// detect types
 	isImage := strings.HasPrefix(contentType, "image/") ||
 		fileExt == ".png" ||
@@ -824,10 +827,27 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		return
 	}
 
+	if page > pageCount {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":   true,
+			"message": fmt.Sprintf("page %d out of range; document has %d page(s)", page, pageCount),
+		})
+		return
+	}
+
 	// =======================
 	// CACHE CHECK
 	// =======================
 	dpi := int(float64(h.cfg.PDFFallbackDPI) * scale)
+
+	if dpi < 72 {
+		dpi = 72
+	}
+
+	if dpi > 150 {
+		dpi = 150
+	}
+
 	cachePath := h.previewCachePath(fileID, page, dpi)
 
 	if resp, err := h.client.Download(r.Context(), cachePath); err == nil {
@@ -875,35 +895,7 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 
 	h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
 
-	prefix := filepath.Join(tmpDir, "preview")
-
-	cmd := exec.CommandContext(
-		r.Context(),
-		"pdftoppm",
-		"-png",
-		"-f", strconv.Itoa(page),
-		"-singlefile",
-		"-r", strconv.Itoa(dpi),
-		pdfPath,
-		prefix,
-	)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
-
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error":   true,
-			"message": strings.TrimSpace(stderr.String()),
-		})
-		return
-	}
-
-	pngPath := prefix + ".png"
-
-	pngBytes, err := os.ReadFile(pngPath)
+	pngBytes, err := h.generatePDFPreviewFromFile(pdfPath, fileID, page, dpi)
 	if err != nil {
 		h.metrics.IncPDFImageFail(h.bucketName(), fileID)
 
@@ -915,16 +907,22 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 
 	h.metrics.IncPDFImageSuccess(h.bucketName())
 
-	// async cache
-	go func(cachePath string, payload []byte) {
-		_, _ = h.client.UploadBytes(
-			context.Background(),
-			cachePath,
-			"file",
-			path.Base(cachePath),
-			payload,
+	// Cache synchronously. If cache upload fails, still return the image.
+	if _, cacheErr := h.client.UploadBytes(
+		context.Background(),
+		cachePath,
+		"file",
+		path.Base(cachePath),
+		pngBytes,
+	); cacheErr != nil {
+		fmt.Printf(
+			"preview cache upload failed for %s page=%d dpi=%d: %v\n",
+			fileID,
+			page,
+			dpi,
+			cacheErr,
 		)
-	}(cachePath, append([]byte(nil), pngBytes...))
+	}
 
 	// response
 	w.Header().Set("Content-Type", "image/png")
@@ -933,6 +931,109 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
 
 	_, _ = w.Write(pngBytes)
+}
+
+func (h *Handler) generatePDFPreviewFromFile(localPDFPath, fileID string, page, dpi int) ([]byte, error) {
+	if page < 1 {
+		return nil, fmt.Errorf("invalid PDF page: %d", page)
+	}
+	if dpi < 72 {
+		dpi = 72
+	}
+	if dpi > 150 {
+		dpi = 150
+	}
+
+	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-upload-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	prefix := filepath.Join(tmpDir, "preview")
+
+	previewCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		previewCtx,
+		"pdftoppm",
+		"-png",
+		"-f", strconv.Itoa(page),
+		"-singlefile",
+		"-r", strconv.Itoa(dpi),
+		localPDFPath,
+		prefix,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return nil, fmt.Errorf("pdftoppm failed: %s", msg)
+		}
+		return nil, err
+	}
+
+	pngPath := prefix + ".png"
+	pngBytes, err := os.ReadFile(pngPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return pngBytes, nil
+}
+
+func isPDFContent(contentType, filename, localPath string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	name := strings.ToLower(strings.TrimSpace(filename))
+
+	if strings.Contains(ct, "pdf") || strings.HasSuffix(name, ".pdf") {
+		return true
+	}
+
+	file, err := os.Open(localPath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	header := make([]byte, 5)
+	n, err := io.ReadFull(file, header)
+	return err == nil && n == 5 && string(header) == "%PDF-"
+}
+
+func detectPDFPageCount(localPath string) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "pdfinfo", localPath)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return 0, fmt.Errorf("pdfinfo failed: %s", msg)
+		}
+		return 0, err
+	}
+
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 || !strings.EqualFold(strings.TrimSpace(parts[0]), "Pages") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil || n < 1 {
+			return 0, fmt.Errorf("invalid PDF page count")
+		}
+		return n, nil
+	}
+
+	return 0, fmt.Errorf("PDF page count not found")
 }
 
 func (h *Handler) readMeta(ctx context.Context, fileID string) (storage.FileMeta, error) {
