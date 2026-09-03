@@ -22,6 +22,8 @@ import (
 	"github.com/mygithub/dms-hitachi-connector/internal/util"
 )
 
+const firstPagePreviewDPI = 72
+
 type Handler struct {
 	cfg     config.Config
 	client  *storage.Client
@@ -469,53 +471,32 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 	}
 
 	// ============================================================
-	// PRE-WARM FIRST PDF PAGE CACHE
+	// PRE-WARM ALL PDF PAGE CACHES
 	//
-	// Do this asynchronously so the upload API can return immediately.
-	// The local staged PDF cannot be used after this handler returns, so
-	// copy it to a private preview temp file before starting the goroutine.
+	// Generate low-DPI previews before returning the upload response.
+	// This prevents DSS/Java from requesting pages before their cache
+	// entries exist, which caused "NO IMAGE AVAILABLE" on first load.
 	//
-	// getimage still has the normal Hitachi-download fallback if Java asks
-	// for the preview before this background warm-up finishes.
+	// We deliberately use 72 DPI here to keep upload-time rendering fast.
+	// getimage continues to generate/cache the requested higher-DPI version
+	// when Java asks for a scale that is not already cached.
 	// ============================================================
 	if pageCount > 0 && isPDFContent(contentType, filename, localPath) {
-		dpi := int(float64(h.cfg.PDFFallbackDPI))
-		if dpi < 72 {
-			dpi = 72
-		}
-		if dpi > 150 {
-			dpi = 150
-		}
+		previewDPI := 72
 
-		previewSource, copyErr := copyPreviewSource(localPath, h.cfg.TempDir, fileID)
-		if copyErr != nil {
-			fmt.Printf("page-1 preview source copy failed for %s: %v\n", fileID, copyErr)
-		} else {
-			go func(sourcePath, id string, renderDPI int) {
-				defer os.Remove(sourcePath)
-
-				pngBytes, previewErr := h.generatePDFPreviewFromFile(
-					sourcePath,
-					id,
-					1,
-					renderDPI,
-				)
-				if previewErr != nil {
-					fmt.Printf("page-1 preview generation failed for %s: %v\n", id, previewErr)
-					return
-				}
-
-				cachePath := h.previewCachePath(id, 1, renderDPI)
-				if _, cacheErr := h.client.UploadBytes(
-					context.Background(),
-					cachePath,
-					"file",
-					path.Base(cachePath),
-					pngBytes,
-				); cacheErr != nil {
-					fmt.Printf("page-1 preview cache upload failed for %s: %v\n", id, cacheErr)
-				}
-			}(previewSource, fileID, dpi)
+		if err := h.prewarmPDFPreviewCache(
+			fileID,
+			localPath,
+			pageCount,
+			previewDPI,
+		); err != nil {
+			// Preview generation must not make a successful document upload
+			// fail. getimage has a normal on-demand rendering fallback.
+			fmt.Printf(
+				"PDF preview prewarm failed for %s: %v\n",
+				fileID,
+				err,
+			)
 		}
 	}
 
@@ -868,6 +849,72 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		return
 	}
 
+	// ============================================================
+	// LOW-DPI PREWARM CACHE FALLBACK
+	//
+	// Upload prewarming stores every PDF page at 72 DPI. If DSS asks
+	// for another scale before that scaled cache has been generated,
+	// serve the already available 72-DPI page instead of returning
+	// an empty/no-image result.
+	// ============================================================
+	if dpi != 72 {
+		fallbackCachePath := h.previewCachePath(fileID, page, 72)
+
+		if resp, err := h.client.Download(r.Context(), fallbackCachePath); err == nil {
+			defer resp.Close()
+			h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
+			h.metrics.IncPDFImageSuccess(h.bucketName())
+
+			if size := resp.ContentLength; size > 0 {
+				w.Header().Set("Content-Length",
+					strconv.FormatInt(size, 10))
+			}
+
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Content-Disposition",
+				fmt.Sprintf("inline; filename=%q", path.Base(fallbackCachePath)))
+
+			_, _ = io.Copy(w, resp.Body)
+			return
+		}
+	}
+
+	// ============================================================
+	// FIRST-LOAD FALLBACK
+	//
+	// Upload pre-warms Page 1 at 72 DPI because that render is fast
+	// enough to complete before the upload response is returned.
+	// DSS may request a different scale/DPI (for example 140 DPI).
+	// If that exact cache is not present yet, serve the guaranteed
+	// 72-DPI Page-1 cache instead of making Java wait for another
+	// PDF render. This prevents the first-load "NO IMAGE AVAILABLE".
+	// ============================================================
+	if page == 1 && dpi != firstPagePreviewDPI {
+		baseCachePath := h.previewCachePath(
+			fileID,
+			1,
+			firstPagePreviewDPI,
+		)
+
+		if resp, err := h.client.Download(r.Context(), baseCachePath); err == nil {
+			defer resp.Close()
+			h.metrics.IncHitachiGetStreamSuccess(h.bucketName())
+			h.metrics.IncPDFImageSuccess(h.bucketName())
+
+			if size := resp.ContentLength; size > 0 {
+				w.Header().Set("Content-Length",
+					strconv.FormatInt(size, 10))
+			}
+
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Content-Disposition",
+				fmt.Sprintf("inline; filename=%q", path.Base(baseCachePath)))
+
+			_, _ = io.Copy(w, resp.Body)
+			return
+		}
+	}
+
 	// =======================
 	// GENERATE PREVIEW
 	// =======================
@@ -931,6 +978,95 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		fmt.Sprintf("inline; filename=%q", path.Base(cachePath)))
 
 	_, _ = w.Write(pngBytes)
+}
+
+func (h *Handler) prewarmPDFPreviewCache(
+	fileID string,
+	localPDFPath string,
+	pageCount int,
+	dpi int,
+) error {
+	if pageCount < 1 {
+		return nil
+	}
+	if dpi < 72 {
+		dpi = 72
+	}
+	if dpi > 150 {
+		dpi = 150
+	}
+
+	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-prewarm-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	prefix := filepath.Join(tmpDir, "preview")
+
+	// Render every page in one pdftoppm invocation. This avoids starting
+	// one Poppler process per page and is much faster for multi-page PDFs.
+	previewCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		previewCtx,
+		"pdftoppm",
+		"-png",
+		"-r", strconv.Itoa(dpi),
+		localPDFPath,
+		prefix,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("pdftoppm prewarm failed: %s", msg)
+		}
+		return err
+	}
+
+	// pdftoppm writes preview-1.png, preview-2.png, ...
+	// Upload each page using the same cache naming convention used by getimage.
+	for page := 1; page <= pageCount; page++ {
+		pngPath := fmt.Sprintf("%s-%d.png", prefix, page)
+
+		pngBytes, err := os.ReadFile(pngPath)
+		if err != nil {
+			return fmt.Errorf(
+				"read prewarmed page %d: %w",
+				page,
+				err,
+			)
+		}
+
+		cachePath := h.previewCachePath(fileID, page, dpi)
+
+		if _, err := h.client.UploadBytes(
+			context.Background(),
+			cachePath,
+			"file",
+			path.Base(cachePath),
+			pngBytes,
+		); err != nil {
+			return fmt.Errorf(
+				"upload prewarmed page %d: %w",
+				page,
+				err,
+			)
+		}
+	}
+
+	fmt.Printf(
+		"PDF preview prewarm completed for %s: pages=%d dpi=%d\n",
+		fileID,
+		pageCount,
+		dpi,
+	)
+
+	return nil
 }
 
 func (h *Handler) generatePDFPreviewFromFile(localPDFPath, fileID string, page, dpi int) ([]byte, error) {
