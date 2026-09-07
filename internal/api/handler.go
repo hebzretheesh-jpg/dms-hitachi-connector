@@ -125,6 +125,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.getContentPreview(rw, r, fileID, page)
 
+	case r.Method == http.MethodDelete && r.URL.Path == "/dss/api/delete":
+		endpoint = "delete_all"
+		h.deleteAll(rw, r)
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/dss/api/delete/"):
+		endpoint = "delete"
+		h.deleteFile(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/delete/"))
+
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/dss/api/get/"):
 		endpoint = "get"
 		h.getBinary(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/get/"))
@@ -659,6 +667,84 @@ func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID strin
 		w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
 	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// deleteFile deletes one CID and its related metadata/preview cache objects.
+func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request, fileID string) {
+	fileID = strings.TrimSuffix(strings.TrimSpace(fileID), "/")
+	if fileID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": true, "errorCode": 1, "message": "Invalid file ID",
+		})
+		return
+	}
+
+	meta, err := h.readMeta(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": true, "errorCode": 2, "message": "File not found",
+		})
+		return
+	}
+
+	if err := h.client.Delete(r.Context(), meta.StoragePath); err != nil {
+		h.metrics.IncHitachiConnectionFail()
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": true, "errorCode": 3, "message": err.Error(),
+			"data": map[string]any{"cid": fileID},
+		})
+		return
+	}
+
+	// Delete metadata. The document is already gone if this fails.
+	if err := h.client.Delete(r.Context(), h.metaPath(fileID)); err != nil {
+		h.metrics.IncHitachiConnectionFail()
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": true, "errorCode": 4,
+			"message": "Document deleted but metadata deletion failed: " + err.Error(),
+			"data":    map[string]any{"cid": fileID},
+		})
+		return
+	}
+
+	pageCount := 1
+	if v := strings.TrimSpace(meta.Tags["page_count"]); v != "" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil && n > 0 {
+			pageCount = n
+		}
+	}
+
+	// Preview caches are derived data. Missing cache objects are harmless.
+	for page := 1; page <= pageCount; page++ {
+		for dpi := 72; dpi <= 150; dpi++ {
+			cachePath := h.previewCachePath(fileID, page, dpi)
+			if err := h.client.Delete(r.Context(), cachePath); err != nil {
+				fmt.Printf("delete preview cache skipped for %s page=%d dpi=%d: %v\n",
+					fileID, page, dpi, err)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"error":     false,
+		"errorCode": 0,
+		"data":      map[string]any{"cid": fileID, "deleted": true},
+	})
+}
+
+// deleteAll is intentionally guarded because the current storage.Client API
+// exposed to Handler provides object-level Delete but does not expose an
+// object-listing/bulk-delete operation. Deleting an S3 prefix by passing the
+// prefix to Delete would NOT recursively delete its objects.
+//
+// Once storage.Client exposes a safe List/DeleteAll operation, this endpoint
+// can call it without changing the rest of the handler.
+func (h *Handler) deleteAll(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotImplemented, map[string]any{
+		"error":     true,
+		"errorCode": 501,
+		"message":   "Delete-all API requires storage.Client object listing/bulk-delete support; object-level Delete cannot safely delete an S3 prefix recursively.",
+	})
 }
 
 func (h *Handler) processFile(w http.ResponseWriter, r *http.Request, fileID string) {
