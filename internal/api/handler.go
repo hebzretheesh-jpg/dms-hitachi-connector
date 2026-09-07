@@ -628,6 +628,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 		"data": map[string]any{
 			"cid":            fileID,
 			"tenant_id":      meta.TenantID,
+			"path":           meta.StoragePath,
 			"deleted":        "false",
 			"content_status": "PROCESSED",
 			"mime_type":      meta.ContentType,
