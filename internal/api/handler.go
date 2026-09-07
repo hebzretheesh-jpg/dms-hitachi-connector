@@ -740,10 +740,26 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request, fileID stri
 // Once storage.Client exposes a safe List/DeleteAll operation, this endpoint
 // can call it without changing the rest of the handler.
 func (h *Handler) deleteAll(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]any{
-		"error":     true,
-		"errorCode": 501,
-		"message":   "Delete-all API requires storage.Client object listing/bulk-delete support; object-level Delete cannot safely delete an S3 prefix recursively.",
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	count, err := h.client.DeleteAll(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":     true,
+			"errorCode": http.StatusInternalServerError,
+			"message":   err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"error":     false,
+		"errorCode": 0,
+		"data": map[string]any{
+			"deleted":       true,
+			"objects_count": count,
+		},
 	})
 }
 

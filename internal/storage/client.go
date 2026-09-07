@@ -420,3 +420,58 @@ func copyFile(srcPath, dstPath string) error {
 
 	return err
 }
+func (c *Client) DeleteAll(ctx context.Context) (int, error) {
+	opts := minio.ListObjectsOptions{
+		Recursive: true,
+	}
+
+	if c.prefix != "" {
+		opts.Prefix = c.prefix + "/"
+	}
+
+	var objects []minio.ObjectInfo
+
+	for object := range c.client.ListObjects(ctx, c.bucket, opts) {
+		if object.Err != nil {
+			return len(objects), object.Err
+		}
+
+		objects = append(objects, object)
+	}
+
+	if len(objects) == 0 {
+		return 0, nil
+	}
+
+	removeCh := make(chan minio.ObjectInfo)
+
+	go func() {
+		defer close(removeCh)
+
+		for _, object := range objects {
+			select {
+			case removeCh <- object:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	errorCh := c.client.RemoveObjects(
+		ctx,
+		c.bucket,
+		removeCh,
+		minio.RemoveObjectsOptions{},
+	)
+
+	count := 0
+
+	for err := range errorCh {
+		if err.Err != nil {
+			return count, err.Err
+		}
+		count++
+	}
+
+	return count, nil
+}
