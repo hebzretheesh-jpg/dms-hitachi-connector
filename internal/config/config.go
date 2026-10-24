@@ -4,10 +4,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+type DSSServer struct {
+	Name string
+	URL  string
+}
 
 type Config struct {
 	ListenAddr                string
@@ -30,60 +37,288 @@ type Config struct {
 	MaxUploadBytes            int64
 	PDFFallbackDPI            int
 	WorkerID                  int
+
+	// DSS routing configuration.
+	// Servers are ordered by Name.
+	DSSServers []DSSServer
+
+	// Identity of the DSS server represented by this connector.
+	DSSLocalServerName string
 }
 
 func Load() (Config, error) {
 	tempDir := getEnv("TEMP_DIR", os.TempDir())
 
 	cfg := Config{
-		ListenAddr:                getEnv("LISTEN_ADDR", ":9082"),
-		ReadTimeout:               getDurationEnv("READ_TIMEOUT", 30*time.Second),
-		WriteTimeout:              getDurationEnv("WRITE_TIMEOUT", 5*time.Minute),
-		IdleTimeout:               getDurationEnv("IDLE_TIMEOUT", 60*time.Second),
-		HitachiEndpoint:           getEnv("HITACHI_ENDPOINT", ""),
-		HitachiAccessKeyID:        getEnv("HITACHI_ACCESS_KEY_ID", ""),
-		HitachiSecretAccessKey:    getEnv("HITACHI_SECRET_ACCESS_KEY", ""),
-		HitachiRegion:             getEnv("HITACHI_REGION", "us-east-1"),
-		HitachiBucket:             getEnv("HITACHI_BUCKET", "dms-connector"),
-		HitachiUsePathStyle:       getBoolEnv("HITACHI_USE_PATH_STYLE", true),
-		HitachiInsecureSkipVerify: getBoolEnv("HITACHI_INSECURE_SKIP_VERIFY", false),
-		SkipStorageHealthCheck:    getBoolEnv("HITACHI_SKIP_STORAGE_HEALTH_CHECK", false),
-		InternalRoot:              strings.Trim(strings.TrimRight(getEnv("HITACHI_OBJECT_PREFIX", "/connector/dms"), "/"), "/"),
-		HTTPTimeout:               getDurationEnv("HITACHI_HTTP_TIMEOUT", 60*time.Second),
-		TempDir:                   tempDir,
-		DownloadCacheDir:          getEnv("DOWNLOAD_CACHE_DIR", filepath.Join(tempDir, "dms-download-cache")),
-		DownloadCacheMaxFiles:     getIntEnv("DOWNLOAD_CACHE_MAX_FILES", 128),
-		MaxUploadBytes:            getInt64Env("MAX_UPLOAD_BYTES", 64<<20),
-		PDFFallbackDPI:            getIntEnv("PDF_RENDER_DPI", 144),
-		WorkerID:                  getIntEnv("WORKER_ID", 0),
+		ListenAddr: getEnv(
+			"LISTEN_ADDR",
+			":9082",
+		),
+
+		ReadTimeout: getDurationEnv(
+			"READ_TIMEOUT",
+			30*time.Second,
+		),
+
+		WriteTimeout: getDurationEnv(
+			"WRITE_TIMEOUT",
+			5*time.Minute,
+		),
+
+		IdleTimeout: getDurationEnv(
+			"IDLE_TIMEOUT",
+			60*time.Second,
+		),
+
+		HitachiEndpoint: getEnv(
+			"HITACHI_ENDPOINT",
+			"",
+		),
+
+		HitachiAccessKeyID: getEnv(
+			"HITACHI_ACCESS_KEY_ID",
+			"",
+		),
+
+		HitachiSecretAccessKey: getEnv(
+			"HITACHI_SECRET_ACCESS_KEY",
+			"",
+		),
+
+		HitachiRegion: getEnv(
+			"HITACHI_REGION",
+			"us-east-1",
+		),
+
+		HitachiBucket: getEnv(
+			"HITACHI_BUCKET",
+			"dms-connector",
+		),
+
+		HitachiUsePathStyle: getBoolEnv(
+			"HITACHI_USE_PATH_STYLE",
+			true,
+		),
+
+		HitachiInsecureSkipVerify: getBoolEnv(
+			"HITACHI_INSECURE_SKIP_VERIFY",
+			false,
+		),
+
+		SkipStorageHealthCheck: getBoolEnv(
+			"HITACHI_SKIP_STORAGE_HEALTH_CHECK",
+			false,
+		),
+
+		InternalRoot: strings.Trim(
+			strings.TrimRight(
+				getEnv(
+					"HITACHI_OBJECT_PREFIX",
+					"/connector/dms",
+				),
+				"/",
+			),
+			"/",
+		),
+
+		HTTPTimeout: getDurationEnv(
+			"HITACHI_HTTP_TIMEOUT",
+			60*time.Second,
+		),
+
+		TempDir: tempDir,
+
+		DownloadCacheDir: getEnv(
+			"DOWNLOAD_CACHE_DIR",
+			filepath.Join(
+				tempDir,
+				"dms-download-cache",
+			),
+		),
+
+		DownloadCacheMaxFiles: getIntEnv(
+			"DOWNLOAD_CACHE_MAX_FILES",
+			128,
+		),
+
+		MaxUploadBytes: getInt64Env(
+			"MAX_UPLOAD_BYTES",
+			64<<20,
+		),
+
+		PDFFallbackDPI: getIntEnv(
+			"PDF_RENDER_DPI",
+			144,
+		),
+
+		WorkerID: getIntEnv(
+			"WORKER_ID",
+			0,
+		),
+
+		// Local DSS identity.
+		DSSLocalServerName: strings.TrimSpace(
+			getEnv(
+				"DSS_LOCAL_SERVER_NAME",
+				"A.1",
+			),
+		),
 	}
 
+	// Load configured DSS servers.
+	cfg.DSSServers = LoadDSSServers()
+
+	// Validate required Hitachi configuration.
 	if cfg.HitachiEndpoint == "" {
-		return cfg, fmt.Errorf("HITACHI_ENDPOINT must be set")
+		return cfg, fmt.Errorf(
+			"HITACHI_ENDPOINT must be set",
+		)
 	}
+
 	if cfg.HitachiAccessKeyID == "" {
-		return cfg, fmt.Errorf("HITACHI_ACCESS_KEY_ID must be set")
+		return cfg, fmt.Errorf(
+			"HITACHI_ACCESS_KEY_ID must be set",
+		)
 	}
+
 	if cfg.HitachiSecretAccessKey == "" {
-		return cfg, fmt.Errorf("HITACHI_SECRET_ACCESS_KEY must be set")
+		return cfg, fmt.Errorf(
+			"HITACHI_SECRET_ACCESS_KEY must be set",
+		)
 	}
+
 	if cfg.HitachiBucket == "" {
-		return cfg, fmt.Errorf("HITACHI_BUCKET must be set")
+		return cfg, fmt.Errorf(
+			"HITACHI_BUCKET must be set",
+		)
 	}
 
 	return cfg, nil
 }
 
-func getBoolEnv(key string, fallback bool) bool {
+// LoadDSSServers loads DSS server definitions from environment variables.
+//
+// Supported variables:
+//
+// DSS_SERVER_1_NAME=A.1
+// DSS_SERVER_1_URL=http://host1:port
+//
+// DSS_SERVER_2_NAME=A.2
+// DSS_SERVER_2_URL=http://host2:port
+//
+// DSS_SERVER_3_NAME=A.3
+// DSS_SERVER_3_URL=http://host3:port
+//
+// Incomplete entries are skipped.
+//
+// Server entries are sorted alphabetically by Name.
+// Duplicate names are ignored after the first valid entry.
+func LoadDSSServers() []DSSServer {
+	indexPattern := regexp.MustCompile(
+		`^DSS_SERVER_([0-9]+)_NAME$`,
+	)
+
+	env := os.Environ()
+
+	var servers []DSSServer
+
+	seenNames := make(map[string]bool)
+
+	for _, item := range env {
+		parts := strings.SplitN(
+			item,
+			"=",
+			2,
+		)
+
+		if len(parts) != 2 {
+			continue
+		}
+
+		envKey := parts[0]
+
+		matches := indexPattern.FindStringSubmatch(
+			envKey,
+		)
+
+		if len(matches) != 2 {
+			continue
+		}
+
+		index := matches[1]
+
+		name := strings.TrimSpace(
+			os.Getenv(
+				"DSS_SERVER_" + index + "_NAME",
+			),
+		)
+
+		serverURL := strings.TrimSpace(
+			os.Getenv(
+				"DSS_SERVER_" + index + "_URL",
+			),
+		)
+
+		// Ignore incomplete entries.
+		if name == "" || serverURL == "" {
+			continue
+		}
+
+		// Normalize trailing slashes.
+		serverURL = strings.TrimRight(
+			serverURL,
+			"/",
+		)
+
+		// Avoid duplicate DSS names.
+		if seenNames[name] {
+			continue
+		}
+
+		seenNames[name] = true
+
+		servers = append(
+			servers,
+			DSSServer{
+				Name: name,
+				URL:  serverURL,
+			},
+		)
+	}
+
+	// Stable alphabetical ordering.
+	sort.Slice(
+		servers,
+		func(i, j int) bool {
+			return servers[i].Name < servers[j].Name
+		},
+	)
+
+	return servers
+}
+
+func getBoolEnv(
+	key string,
+	fallback bool,
+) bool {
 	if value := os.Getenv(key); value != "" {
-		value = strings.ToLower(strings.TrimSpace(value))
-		return value == "1" || value == "true" || value == "yes" || value == "on"
+		value = strings.ToLower(
+			strings.TrimSpace(value),
+		)
+
+		return value == "1" ||
+			value == "true" ||
+			value == "yes" ||
+			value == "on"
 	}
 
 	return fallback
 }
 
-func getEnv(key, fallback string) string {
+func getEnv(
+	key string,
+	fallback string,
+) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
@@ -91,7 +326,10 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func getDurationEnv(key string, fallback time.Duration) time.Duration {
+func getDurationEnv(
+	key string,
+	fallback time.Duration,
+) time.Duration {
 	if value := os.Getenv(key); value != "" {
 		if duration, err := time.ParseDuration(value); err == nil {
 			return duration
@@ -101,9 +339,16 @@ func getDurationEnv(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-func getInt64Env(key string, fallback int64) int64 {
+func getInt64Env(
+	key string,
+	fallback int64,
+) int64 {
 	if value := os.Getenv(key); value != "" {
-		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if parsed, err := strconv.ParseInt(
+			value,
+			10,
+			64,
+		); err == nil {
 			return parsed
 		}
 	}
@@ -111,9 +356,14 @@ func getInt64Env(key string, fallback int64) int64 {
 	return fallback
 }
 
-func getIntEnv(key string, fallback int) int {
+func getIntEnv(
+	key string,
+	fallback int,
+) int {
 	if value := os.Getenv(key); value != "" {
-		if parsed, err := strconv.Atoi(value); err == nil {
+		if parsed, err := strconv.Atoi(
+			value,
+		); err == nil {
 			return parsed
 		}
 	}

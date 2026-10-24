@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -25,6 +26,23 @@ type Client struct {
 	bucket string
 	prefix string
 	cache  *downloadCache
+}
+
+// IsObjectNotFound reports whether an error specifically indicates
+// that the requested object does not exist.
+func IsObjectNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var resp minio.ErrorResponse
+
+	if errors.As(err, &resp) {
+		return resp.Code == "NoSuchKey" ||
+			resp.Code == "NoSuchObject"
+	}
+
+	return false
 }
 
 type Tags map[string]string

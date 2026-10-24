@@ -23,7 +23,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	// Temporary diagnostic: display configured DSS servers
+	log.Printf("Configured DSS servers: %d", len(cfg.DSSServers))
 
+	for _, s := range cfg.DSSServers {
+		log.Printf("DSS server configured: name=%s url=%s", s.Name, s.URL)
+	}
 	m := metrics.New()
 
 	client, err := storage.NewClient(

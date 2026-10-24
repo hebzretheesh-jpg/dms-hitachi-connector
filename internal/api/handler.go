@@ -36,16 +36,13 @@ func New(cfg config.Config, client *storage.Client, idGen *util.IDGenerator, m *
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-	fmt.Println("🔥 S3 HIT")
-	fmt.Println(r)
-
 	start := time.Now()
 	rw := &statusWriter{ResponseWriter: w, status: 200}
 	endpoint := "unknown"
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		endpoint = "root"
-		writeJSON(rw, http.StatusOK, map[string]any{"status": "ok", "endpoints": []string{"/dss/api/ping", "/metrics", "/healthz"}})
+		writeJSON(rw, http.StatusOK, map[string]any{"status": "ok", "endpoints": []string{"/dss/api/ping", "/metrics", "/healthz", "/readyz"}})
 
 	case r.Method == http.MethodGet && r.URL.Path == "/dss/api/ping":
 		endpoint = "ping"
@@ -73,13 +70,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusOK, map[string]any{"status": "ok"})
 	case r.Method == http.MethodGet && r.URL.Path == "/readyz":
 		endpoint = "readyz"
-		if !h.cfg.SkipStorageHealthCheck {
-			if err := h.client.Health(r.Context()); err != nil {
-				writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
-				break
-			}
+		checks := map[string]string{}
+		ready := true
+		if h.cfg.SkipStorageHealthCheck {
+			checks["storage"] = "skipped_by_configuration"
+		} else if err := h.client.Health(r.Context()); err != nil {
+			checks["storage"] = "error"
+			ready = false
+		} else {
+			checks["storage"] = "ok"
 		}
-		writeJSON(rw, http.StatusOK, map[string]any{"status": "ready"})
+		if err := h.idGen.HealthError(); err != nil {
+			checks["id_generator"] = "error"
+			ready = false
+		} else {
+			checks["id_generator"] = "ok"
+		}
+		if !ready {
+			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "not_ready", "checks": checks})
+			break
+		}
+		writeJSON(rw, http.StatusOK, map[string]any{"status": "ready", "checks": checks})
 	case matchMethods(r.Method, http.MethodGet, http.MethodPost, http.MethodPut) && strings.HasPrefix(r.URL.Path, "/dss/api/put/"):
 		endpoint = "put"
 		h.uploadBinaryData(rw, r, strings.TrimPrefix(r.URL.Path, "/dss/api/put/"))
@@ -610,12 +621,24 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
 
 	if err != nil {
-		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncGetStatsFail(h.bucketName(), fileID)
 
-		writeJSON(w, http.StatusNotFound, map[string]any{
+		// Return 404 only when the storage error specifically
+		// indicates that the object does not exist.
+		if storage.IsObjectNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"error":   true,
+				"message": "The specified key does not exist.",
+			})
+			return
+		}
+
+		// Other storage errors should not be reported as missing CIDs.
+		h.metrics.IncHitachiConnectionFail()
+
+		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"error":   true,
-			"message": err.Error(),
+			"message": "Storage request failed.",
 		})
 		return
 	}
@@ -640,9 +663,13 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 func (h *Handler) getBinary(w http.ResponseWriter, r *http.Request, fileID string) {
 	meta, err := h.readMeta(r.Context(), fileID)
 	if err != nil {
-		h.metrics.IncHitachiConnectionFail()
 		h.metrics.IncFileDownloadFail(h.bucketName(), fileID)
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": err.Error()})
+		if storage.IsObjectNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": true, "message": "The specified key does not exist."})
+			return
+		}
+		h.metrics.IncHitachiConnectionFail()
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": "Storage request failed."})
 		return
 	}
 	resp, err := h.client.Download(r.Context(), meta.StoragePath)
