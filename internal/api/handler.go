@@ -36,6 +36,20 @@ func New(cfg config.Config, client *storage.Client, idGen *util.IDGenerator, m *
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
+	// Retrieval failover: try configured peer connectors first. Peer requests
+	// carry a guard header so they execute only their local retrieval path.
+	if r.Method == http.MethodGet && r.Header.Get("X-DSS-Fallback-Hop") != "1" &&
+		(isRetrievalPath(r.URL.Path)) {
+		found, err := h.tryPeerRetrieval(w, r)
+		if found {
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": "Peer retrieval failed; CID absence was not established."})
+			return
+		}
+	}
+
 	start := time.Now()
 	rw := &statusWriter{ResponseWriter: w, status: 200}
 	endpoint := "unknown"
@@ -46,20 +60,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodGet && r.URL.Path == "/dss/api/ping":
 		endpoint = "ping"
+
+		// Match the Flask ping response envelope for healthy and unhealthy states.
+		serverName := strings.TrimSpace(os.Getenv("DSS_LOCAL_SERVER_NAME"))
+		if serverName == "" {
+			serverName = "unknown"
+		}
+
+		pingReply := func(failed bool) map[string]any {
+			code := 0
+			if failed {
+				code = 1
+			}
+
+			reply := map[string]any{
+				"error":     failed,
+				"errorCode": code,
+				"msg":       "!DSS",
+				"data": map[string]any{
+					"server_name": serverName,
+				},
+			}
+
+			if !failed {
+				reply["status"] = "ok"
+			}
+
+			return reply
+		}
 		if !h.cfg.SkipStorageHealthCheck {
 			if err := h.client.Health(r.Context()); err != nil {
 				h.metrics.IncPingFailure()
 				h.metrics.IncHitachiConnectionFail()
-				writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+				writeJSON(rw, http.StatusServiceUnavailable, pingReply(true))
 				break
 			}
 		}
 		if err := h.idGen.HealthError(); err != nil {
 			h.metrics.IncPingFailure()
-			writeJSON(rw, http.StatusServiceUnavailable, map[string]any{"status": "error", "message": err.Error()})
+			writeJSON(rw, http.StatusServiceUnavailable, pingReply(true))
 		} else {
 			h.metrics.IncPingSuccess()
-			writeJSON(rw, http.StatusOK, map[string]any{"status": "ok"})
+			writeJSON(rw, http.StatusOK, pingReply(false))
 		}
 	case r.Method == http.MethodGet && r.URL.Path == "/metrics":
 		endpoint = "metrics"
@@ -1360,4 +1402,49 @@ func extensionFromContentType(contentType string) string {
 		return ""
 	}
 	return exts[0]
+}
+
+func isRetrievalPath(p string) bool {
+	return strings.HasPrefix(p, "/dss/api/stats/") ||
+		strings.HasPrefix(p, "/dss/api/get/") ||
+		strings.HasPrefix(p, "/dss/api/getimage/")
+}
+
+// tryPeerRetrieval tries the configured remote connector endpoints. A peer
+// 404 is the only response that permits continuing. Any transport failure
+// or non-404 response is relayed/treated as a terminal outcome.
+func (h *Handler) tryPeerRetrieval(w http.ResponseWriter, r *http.Request) (bool, error) {
+	localName := strings.TrimSpace(os.Getenv("DSS_LOCAL_SERVER_NAME"))
+	client := &http.Client{Timeout: 30 * time.Second}
+	for i := 1; i <= 3; i++ {
+		name := strings.TrimSpace(os.Getenv(fmt.Sprintf("DSS_SERVER_%d_NAME", i)))
+		base := strings.TrimRight(strings.TrimSpace(os.Getenv(fmt.Sprintf("DSS_SERVER_%d_URL", i))), "/")
+		if base == "" || (name != "" && name == localName) {
+			continue
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, base+r.URL.RequestURI(), nil)
+		if err != nil {
+			return false, err
+		}
+		req.Header = r.Header.Clone()
+		req.Header.Set("X-DSS-Fallback-Hop", "1")
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, err
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			continue
+		}
+		defer resp.Body.Close()
+		for k, vals := range resp.Header {
+			for _, v := range vals {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, copyErr := io.Copy(w, resp.Body)
+		return true, copyErr
+	}
+	return false, nil
 }
