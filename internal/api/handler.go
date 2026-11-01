@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mygithub/dms-hitachi-connector/internal/config"
@@ -24,17 +25,37 @@ import (
 
 const firstPagePreviewDPI = 72
 
+// maxBackgroundPrewarms limits how many documents are pre-rendered in the
+// background at the same time. Further documents wait for a free slot.
+const maxBackgroundPrewarms = 2
+
 type Handler struct {
 	cfg     config.Config
 	client  *storage.Client
 	idGen   *util.IDGenerator
 	metrics *metrics.Registry
+
+	// pageCountCalls de-duplicates concurrent page-count repairs for the
+	// same file ID (stats and getimage arrive in parallel).
+	pageCountCalls sync.Map
+	// pageCountFailures remembers file IDs whose repair failed, so a
+	// damaged PDF is not downloaded again on every view.
+	pageCountFailures sync.Map
+	prewarmSlots      chan struct{}
 }
 
 func New(cfg config.Config, client *storage.Client, idGen *util.IDGenerator, m *metrics.Registry) *Handler {
-	return &Handler{cfg: cfg, client: client, idGen: idGen, metrics: m}
+	return &Handler{
+		cfg:          cfg,
+		client:       client,
+		idGen:        idGen,
+		metrics:      m,
+		prewarmSlots: make(chan struct{}, maxBackgroundPrewarms),
+	}
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fmt.Printf("request start: %s %s remote=%s content-type=%q content-length=%d transfer-encoding=%v expect=%q\n",
+		r.Method, r.URL.RequestURI(), r.RemoteAddr, r.Header.Get("Content-Type"), r.ContentLength, r.TransferEncoding, r.Header.Get("Expect"))
 
 	// Retrieval failover: try configured peer connectors first. Peer requests
 	// carry a guard header so they execute only their local retrieval path.
@@ -200,6 +221,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(rw, r)
 	}
 	h.metrics.Observe(endpoint, r.Method, rw.status, time.Since(start).Seconds())
+	fmt.Printf("request end: %s %s endpoint=%s status=%d duration=%s\n",
+		r.Method, r.URL.RequestURI(), endpoint, rw.status, time.Since(start))
 }
 func matchMethods(got string, methods ...string) bool {
 	for _, m := range methods {
@@ -402,9 +425,15 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 
 	// Detect PDF page count while the uploaded file is staged locally.
 	pageCount := 1
+	pageCountVerified := false
 	if isPDFContent(contentType, filename, localPath) {
 		if n, err := detectPDFPageCount(localPath); err == nil && n > 0 {
 			pageCount = n
+			pageCountVerified = true
+		} else {
+			// page_count stays 1 without the verified tag, so
+			// ensurePageCount retries the count when the file is viewed.
+			fmt.Printf("PDF page count detection failed for %s: %v\n", filename, err)
 		}
 	}
 	//
@@ -475,6 +504,10 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		},
 	}
 
+	if pageCountVerified {
+		meta.Tags[pageCountVerifiedTag] = "true"
+	}
+
 	// ============================================================
 	// SAVE METADATA
 	//
@@ -532,15 +565,17 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 	}
 
 	// ============================================================
-	// PRE-WARM ALL PDF PAGE CACHES
+	// PRE-WARM PDF PAGE CACHES
 	//
-	// Generate low-DPI previews before returning the upload response.
-	// This prevents DSS/Java from requesting pages before their cache
-	// entries exist, which caused "NO IMAGE AVAILABLE" on first load.
+	// Page 1 is rendered at 72 DPI before returning the upload response.
+	// This prevents DSS/Java from requesting the first page before its
+	// cache entry exists, which caused "NO IMAGE AVAILABLE" on first load.
 	//
-	// We deliberately use 72 DPI here to keep upload-time rendering fast.
-	// getimage continues to generate/cache the requested higher-DPI version
-	// when Java asks for a scale that is not already cached.
+	// The remaining pages are rendered in the background. The DSS Java
+	// client gives up after 5 seconds, so rendering and uploading every
+	// page synchronously made multi-page PDF uploads fail even though
+	// the document itself was stored. getimage renders any page that is
+	// not cached yet on demand.
 	// ============================================================
 	if pageCount > 0 && isPDFContent(contentType, filename, localPath) {
 		previewDPI := 72
@@ -548,8 +583,11 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 		if err := h.prewarmPDFPreviewCache(
 			fileID,
 			localPath,
+			1,
+			1,
 			pageCount,
 			previewDPI,
+			false,
 		); err != nil {
 			// Preview generation must not make a successful document upload
 			// fail. getimage has a normal on-demand rendering fallback.
@@ -558,6 +596,42 @@ func (h *Handler) uploadBinaryData(w http.ResponseWriter, r *http.Request, tenan
 				fileID,
 				err,
 			)
+		}
+
+		if pageCount > 1 {
+			// localPath is removed when this handler returns, so the
+			// background render works on its own copy.
+			sourceCopy, err := copyPreviewSource(localPath, h.cfg.TempDir, fileID)
+			if err != nil {
+				fmt.Printf(
+					"PDF preview prewarm skipped for %s: %v\n",
+					fileID,
+					err,
+				)
+			} else {
+				go func() {
+					defer os.Remove(sourceCopy)
+
+					h.prewarmSlots <- struct{}{}
+					defer func() { <-h.prewarmSlots }()
+
+					if err := h.prewarmPDFPreviewCache(
+						fileID,
+						sourceCopy,
+						2,
+						pageCount,
+						pageCount,
+						previewDPI,
+						true,
+					); err != nil {
+						fmt.Printf(
+							"PDF preview prewarm failed for %s: %v\n",
+							fileID,
+							err,
+						)
+					}
+				}()
+			}
 		}
 	}
 
@@ -684,6 +758,8 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request, fileID string) {
 		})
 		return
 	}
+
+	h.ensurePageCount(r.Context(), fileID, &meta)
 
 	h.metrics.IncGetStatsSuccess(h.bucketName())
 
@@ -901,6 +977,8 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 		})
 		return
 	}
+
+	h.ensurePageCount(r.Context(), fileID, &meta)
 
 	// =======================
 	// NORMALIZE TYPE
@@ -1152,13 +1230,41 @@ func (h *Handler) getContentPreview(w http.ResponseWriter, r *http.Request, file
 	_, _ = w.Write(pngBytes)
 }
 
+// prewarmBatchPages is the number of pages rendered per pdftoppm run during
+// prewarm. Each batch is uploaded before the next one starts, so early pages
+// become available quickly and a large PDF never has to render within a
+// single timeout.
+const prewarmBatchPages = 10
+
+// prewarmFirstBatchPages is the size of the first batch. It is kept small
+// because the viewer asks for the pages right after page 1 within a second
+// or two of the upload.
+const prewarmFirstBatchPages = 2
+
+// prewarmNiceLevel lowers the CPU priority of background pdftoppm runs so
+// that on-demand getimage renders, which a user is waiting for, win the CPU.
+const prewarmNiceLevel = "10"
+
+// prewarmPDFPreviewCache renders pages firstPage..lastPage of a PDF with
+// pageCount pages and uploads them to the preview cache in batches.
+// A failed batch is logged and skipped; getimage renders those pages on
+// demand. lowPriority runs pdftoppm under nice.
 func (h *Handler) prewarmPDFPreviewCache(
 	fileID string,
 	localPDFPath string,
+	firstPage int,
+	lastPage int,
 	pageCount int,
 	dpi int,
+	lowPriority bool,
 ) error {
-	if pageCount < 1 {
+	if firstPage < 1 {
+		firstPage = 1
+	}
+	if lastPage > pageCount {
+		lastPage = pageCount
+	}
+	if lastPage < firstPage {
 		return nil
 	}
 	if dpi < 72 {
@@ -1168,6 +1274,70 @@ func (h *Handler) prewarmPDFPreviewCache(
 		dpi = 150
 	}
 
+	failedBatches := 0
+
+	batchSize := prewarmFirstBatchPages
+
+	for batchFirst := firstPage; batchFirst <= lastPage; batchFirst += batchSize {
+		if batchFirst != firstPage {
+			batchSize = prewarmBatchPages
+		}
+
+		batchLast := batchFirst + batchSize - 1
+		if batchLast > lastPage {
+			batchLast = lastPage
+		}
+
+		if err := h.prewarmPDFPreviewBatch(
+			fileID,
+			localPDFPath,
+			batchFirst,
+			batchLast,
+			pageCount,
+			dpi,
+			lowPriority,
+		); err != nil {
+			failedBatches++
+			fmt.Printf(
+				"PDF preview prewarm batch failed for %s: pages=%d-%d: %v\n",
+				fileID,
+				batchFirst,
+				batchLast,
+				err,
+			)
+		}
+	}
+
+	if failedBatches > 0 {
+		return fmt.Errorf(
+			"%d batch(es) failed for pages %d-%d",
+			failedBatches,
+			firstPage,
+			lastPage,
+		)
+	}
+
+	fmt.Printf(
+		"PDF preview prewarm completed for %s: pages=%d-%d of %d dpi=%d\n",
+		fileID,
+		firstPage,
+		lastPage,
+		pageCount,
+		dpi,
+	)
+
+	return nil
+}
+
+func (h *Handler) prewarmPDFPreviewBatch(
+	fileID string,
+	localPDFPath string,
+	firstPage int,
+	lastPage int,
+	pageCount int,
+	dpi int,
+	lowPriority bool,
+) error {
 	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-preview-prewarm-")
 	if err != nil {
 		return err
@@ -1176,19 +1346,28 @@ func (h *Handler) prewarmPDFPreviewCache(
 
 	prefix := filepath.Join(tmpDir, "preview")
 
-	// Render every page in one pdftoppm invocation. This avoids starting
-	// one Poppler process per page and is much faster for multi-page PDFs.
+	// Render the whole batch in one pdftoppm invocation. This avoids
+	// starting one Poppler process per page.
 	previewCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(
-		previewCtx,
+	args := []string{
 		"pdftoppm",
 		"-png",
 		"-r", strconv.Itoa(dpi),
+		"-f", strconv.Itoa(firstPage),
+		"-l", strconv.Itoa(lastPage),
 		localPDFPath,
 		prefix,
-	)
+	}
+
+	if lowPriority {
+		if nicePath, err := exec.LookPath("nice"); err == nil {
+			args = append([]string{nicePath, "-n", prewarmNiceLevel}, args...)
+		}
+	}
+
+	cmd := exec.CommandContext(previewCtx, args[0], args[1:]...)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -1200,10 +1379,17 @@ func (h *Handler) prewarmPDFPreviewCache(
 		return err
 	}
 
-	// pdftoppm writes preview-1.png, preview-2.png, ...
+	// pdftoppm writes preview-1.png, preview-2.png, ... and zero-pads the
+	// page number to the digit count of the document's page count
+	// (preview-01.png for a 12-page PDF).
 	// Upload each page using the same cache naming convention used by getimage.
-	for page := 1; page <= pageCount; page++ {
-		pngPath := fmt.Sprintf("%s-%d.png", prefix, page)
+	padWidth := len(strconv.Itoa(pageCount))
+
+	for page := firstPage; page <= lastPage; page++ {
+		pngPath := fmt.Sprintf("%s-%0*d.png", prefix, padWidth, page)
+		if _, err := os.Stat(pngPath); err != nil {
+			pngPath = fmt.Sprintf("%s-%d.png", prefix, page)
+		}
 
 		pngBytes, err := os.ReadFile(pngPath)
 		if err != nil {
@@ -1230,13 +1416,6 @@ func (h *Handler) prewarmPDFPreviewCache(
 			)
 		}
 	}
-
-	fmt.Printf(
-		"PDF preview prewarm completed for %s: pages=%d dpi=%d\n",
-		fileID,
-		pageCount,
-		dpi,
-	)
 
 	return nil
 }
@@ -1350,6 +1529,177 @@ func (h *Handler) readMeta(ctx context.Context, fileID string) (storage.FileMeta
 		return meta, err
 	}
 	return meta, nil
+}
+
+type pageCountCall struct {
+	done      chan struct{}
+	pageCount int
+	err       error
+}
+
+// metaLooksLikePDF mirrors the PDF detection used by getContentPreview.
+func metaLooksLikePDF(fileID string, meta storage.FileMeta) bool {
+	contentType := strings.ToLower(strings.TrimSpace(meta.ContentType))
+	if strings.HasPrefix(contentType, "image/") {
+		return false
+	}
+
+	fileName := strings.ToLower(strings.TrimSpace(meta.Tags["original_filename"]))
+	if fileName == "" {
+		fileName = strings.ToLower(fileID + ".pdf")
+	}
+
+	return strings.Contains(contentType, "pdf") || filepath.Ext(fileName) == ".pdf"
+}
+
+// pageCountVerifiedTag marks metadata whose page_count was read from the
+// PDF itself rather than defaulted.
+const pageCountVerifiedTag = "page_count_verified"
+
+// ensurePageCount repairs metadata whose page_count cannot be trusted:
+// missing, invalid, or "1" without the verified tag. Uploads (including the
+// migration) wrote a default of 1 whenever pdfinfo failed, so stats reported
+// a single page and getimage rejected every page after the first. Counts
+// above 1 always came from pdfinfo and are trusted.
+//
+// The PDF is downloaded once, its page count is written back into the
+// metadata object, meta is updated in place, and all pages are pre-rendered
+// in the background. Errors are logged and leave meta unchanged, so callers
+// fall back to the previous behaviour.
+func (h *Handler) ensurePageCount(ctx context.Context, fileID string, meta *storage.FileMeta) {
+	if v := strings.TrimSpace(meta.Tags["page_count"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && (n > 1 || (n == 1 && meta.Tags[pageCountVerifiedTag] == "true")) {
+			return
+		}
+	}
+
+	if !metaLooksLikePDF(fileID, *meta) {
+		return
+	}
+
+	// Don't download the same file on every view when repair keeps failing
+	// (for example, a damaged PDF). Retried after a connector restart.
+	if _, failed := h.pageCountFailures.Load(fileID); failed {
+		return
+	}
+
+	call := &pageCountCall{done: make(chan struct{})}
+	if existing, loaded := h.pageCountCalls.LoadOrStore(fileID, call); loaded {
+		other := existing.(*pageCountCall)
+		select {
+		case <-other.done:
+		case <-ctx.Done():
+			return
+		}
+		if other.err == nil {
+			setMetaPageCount(meta, other.pageCount)
+		}
+		return
+	}
+
+	call.pageCount, call.err = h.repairPageCount(ctx, fileID, *meta)
+	h.pageCountCalls.Delete(fileID)
+	close(call.done)
+
+	if call.err != nil {
+		fmt.Printf("page count repair failed for %s: %v\n", fileID, call.err)
+		// A cancelled request (the client gave up) is not a file problem,
+		// so leave it to be retried on the next view.
+		if ctx.Err() == nil {
+			h.pageCountFailures.Store(fileID, struct{}{})
+		}
+		return
+	}
+
+	setMetaPageCount(meta, call.pageCount)
+}
+
+func setMetaPageCount(meta *storage.FileMeta, pageCount int) {
+	if meta.Tags == nil {
+		meta.Tags = storage.Tags{}
+	}
+	meta.Tags["page_count"] = strconv.Itoa(pageCount)
+	meta.Tags[pageCountVerifiedTag] = "true"
+}
+
+func (h *Handler) repairPageCount(ctx context.Context, fileID string, meta storage.FileMeta) (int, error) {
+	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-page-count-")
+	if err != nil {
+		return 0, err
+	}
+
+	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
+
+	if err := h.client.DownloadToFile(ctx, meta.StoragePath, pdfPath); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return 0, fmt.Errorf("download: %w", err)
+	}
+
+	pageCount, err := detectPDFPageCount(pdfPath)
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return 0, err
+	}
+
+	if err := h.saveMetaPageCount(ctx, fileID, pageCount); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return 0, fmt.Errorf("save metadata: %w", err)
+	}
+
+	fmt.Printf("page count repaired for %s: pages=%d\n", fileID, pageCount)
+
+	// Pre-render every page so later page views are served from cache.
+	// The background job owns tmpDir from here on.
+	go func() {
+		defer os.RemoveAll(tmpDir)
+
+		h.prewarmSlots <- struct{}{}
+		defer func() { <-h.prewarmSlots }()
+
+		if err := h.prewarmPDFPreviewCache(
+			fileID,
+			pdfPath,
+			1,
+			pageCount,
+			pageCount,
+			firstPagePreviewDPI,
+			true,
+		); err != nil {
+			fmt.Printf("PDF preview prewarm failed for %s: %v\n", fileID, err)
+		}
+	}()
+
+	return pageCount, nil
+}
+
+// saveMetaPageCount sets tags.page_count in the stored metadata object.
+// The object is edited as raw JSON so fields this connector does not know
+// about (for example, ones written by the migration connector) are kept.
+func (h *Handler) saveMetaPageCount(ctx context.Context, fileID string, pageCount int) error {
+	var raw map[string]json.RawMessage
+	if err := h.client.ReadJSON(ctx, h.metaPath(fileID), &raw); err != nil {
+		return err
+	}
+
+	var tags storage.Tags
+	if rawTags, ok := raw["tags"]; ok {
+		if err := json.Unmarshal(rawTags, &tags); err != nil {
+			return fmt.Errorf("parse tags: %w", err)
+		}
+	}
+	if tags == nil {
+		tags = storage.Tags{}
+	}
+	tags["page_count"] = strconv.Itoa(pageCount)
+	tags[pageCountVerifiedTag] = "true"
+
+	encodedTags, err := json.Marshal(tags)
+	if err != nil {
+		return err
+	}
+	raw["tags"] = encodedTags
+
+	return h.client.UploadJSON(ctx, h.metaPath(fileID), raw)
 }
 
 func (h *Handler) moveBinaryToFailed(ctx context.Context, fileID, fileName, localPath string) (string, error) {

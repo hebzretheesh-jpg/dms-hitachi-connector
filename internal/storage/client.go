@@ -362,6 +362,15 @@ func (c *Client) DownloadToFile(ctx context.Context, filerPath, localPath string
 		return err
 	}
 
+	// Hard-link instead of copying so large PDFs are not duplicated on every
+	// preview request. The link stays valid even if the cache evicts the
+	// entry. Callers must treat localPath as read-only, since writes would
+	// change the cached copy. Fall back to a copy when linking is not
+	// possible (for example, cache and temp dirs on different filesystems).
+	if err := os.Link(cachedPath, localPath); err == nil {
+		return nil
+	}
+
 	return copyFile(cachedPath, localPath)
 }
 

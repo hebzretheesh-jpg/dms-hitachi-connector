@@ -13,40 +13,40 @@ type Registry struct {
 	requests  map[string]int64
 	durations map[string]float64
 
-	pingSuccess      int64
-	pingFailure      int64
+	pingSuccess           int64
+	pingFailure           int64
 	hitachiConnectionFail int64
 
-	hitachiUploadFail        map[string]int64
-	hitachiUploadSuccess     map[string]int64
-	hitachiGetStreamFail     map[string]int64
-	hitachiGetStreamSuccess  map[string]int64
-	fileUploadSuccess   map[string]int64
-	fileUploadFail      map[string]int64
-	fileDownloadSuccess map[string]int64
-	fileDownloadFail    map[string]int64
-	getStatsFail        map[string]int64
-	getStatsSuccess     map[string]int64
-	getPDFImageSuccess  map[string]int64
-	getPDFImageFail     map[string]int64
+	hitachiUploadFail       map[string]int64
+	hitachiUploadSuccess    map[string]int64
+	hitachiGetStreamFail    map[string]int64
+	hitachiGetStreamSuccess map[string]int64
+	fileUploadSuccess       map[string]int64
+	fileUploadFail          map[string]int64
+	fileDownloadSuccess     map[string]int64
+	fileDownloadFail        map[string]int64
+	getStatsFail            map[string]int64
+	getStatsSuccess         map[string]int64
+	getPDFImageSuccess      map[string]int64
+	getPDFImageFail         map[string]int64
 }
 
 func New() *Registry {
 	return &Registry{
-		requests:            map[string]int64{},
-		durations:           map[string]float64{},
-		hitachiUploadFail:        map[string]int64{},
-		hitachiUploadSuccess:     map[string]int64{},
-		hitachiGetStreamFail:     map[string]int64{},
-		hitachiGetStreamSuccess:  map[string]int64{},
-		fileUploadSuccess:   map[string]int64{},
-		fileUploadFail:      map[string]int64{},
-		fileDownloadSuccess: map[string]int64{},
-		fileDownloadFail:    map[string]int64{},
-		getStatsFail:        map[string]int64{},
-		getStatsSuccess:     map[string]int64{},
-		getPDFImageSuccess:  map[string]int64{},
-		getPDFImageFail:     map[string]int64{},
+		requests:                map[string]int64{},
+		durations:               map[string]float64{},
+		hitachiUploadFail:       map[string]int64{},
+		hitachiUploadSuccess:    map[string]int64{},
+		hitachiGetStreamFail:    map[string]int64{},
+		hitachiGetStreamSuccess: map[string]int64{},
+		fileUploadSuccess:       map[string]int64{},
+		fileUploadFail:          map[string]int64{},
+		fileDownloadSuccess:     map[string]int64{},
+		fileDownloadFail:        map[string]int64{},
+		getStatsFail:            map[string]int64{},
+		getStatsSuccess:         map[string]int64{},
+		getPDFImageSuccess:      map[string]int64{},
+		getPDFImageFail:         map[string]int64{},
 	}
 }
 
