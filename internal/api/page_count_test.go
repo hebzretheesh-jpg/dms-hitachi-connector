@@ -91,3 +91,12 @@ func TestLocalFirstMetadataFileID(t *testing.T) {
 		})
 	}
 }
+
+func TestPreviewPageWidthIsA4Width(t *testing.T) {
+	cases := map[int]int{72: 595, 100: 827, 150: 1240}
+	for dpi, want := range cases {
+		if got := previewPageWidth(dpi); got != want {
+			t.Errorf("previewPageWidth(%d) = %d, want %d", dpi, got, want)
+		}
+	}
+}

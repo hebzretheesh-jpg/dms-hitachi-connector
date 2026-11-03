@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -896,10 +897,14 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request, fileID stri
 	// Preview caches are derived data. Missing cache objects are harmless.
 	for page := 1; page <= pageCount; page++ {
 		for dpi := 72; dpi <= 150; dpi++ {
-			cachePath := h.previewCachePath(fileID, page, dpi)
-			if err := h.client.Delete(r.Context(), cachePath); err != nil {
-				fmt.Printf("delete preview cache skipped for %s page=%d dpi=%d: %v\n",
-					fileID, page, dpi, err)
+			for _, cachePath := range []string{
+				h.previewCachePath(fileID, page, dpi),
+				h.legacyPreviewCachePath(fileID, page, dpi),
+			} {
+				if err := h.client.Delete(r.Context(), cachePath); err != nil {
+					fmt.Printf("delete preview cache skipped for %s page=%d dpi=%d: %v\n",
+						fileID, page, dpi, err)
+				}
 			}
 		}
 	}
@@ -1388,6 +1393,8 @@ func (h *Handler) prewarmPDFPreviewBatch(
 		"pdftoppm",
 		"-png",
 		"-r", strconv.Itoa(dpi),
+		"-scale-to-x", strconv.Itoa(previewPageWidth(dpi)),
+		"-scale-to-y", "-1",
 		"-f", strconv.Itoa(firstPage),
 		"-l", strconv.Itoa(lastPage),
 		localPDFPath,
@@ -1484,6 +1491,8 @@ func (h *Handler) generatePDFPreviewFromFile(localPDFPath, fileID string, page, 
 		"-f", strconv.Itoa(page),
 		"-singlefile",
 		"-r", strconv.Itoa(dpi),
+		"-scale-to-x", strconv.Itoa(previewPageWidth(dpi)),
+		"-scale-to-y", "-1",
 		localPDFPath,
 		prefix,
 	)
@@ -1852,7 +1861,28 @@ func (h *Handler) metaPath(fileID string) string {
 func (h *Handler) pageCountPath(fileID string) string {
 	return path.Join(h.cfg.InternalRoot, "pagecount", fileID+".json")
 }
+
+// previewPageWidth is the pixel width every preview page is rendered at:
+// the width of an A4 page (210 mm) at dpi. Rendering by DPI alone made
+// pages of a smaller paper size (for example an A5 first page in an
+// otherwise A4 document) come out smaller than the other pages in the
+// viewer. Scaling every page to the same width, keeping its aspect ratio,
+// gives all pages of a document the same preview width.
+func previewPageWidth(dpi int) int {
+	return int(math.Round(210.0 / 25.4 * float64(dpi)))
+}
+
+// previewCachePath is the cache object for a rendered page. The "_fw"
+// (fixed width) suffix separates these from caches written before pages
+// were scaled to previewPageWidth; HCP does not allow overwriting, so the
+// old, differently sized images would otherwise keep being served.
 func (h *Handler) previewCachePath(fileID string, page, dpi int) string {
+	return path.Join(h.cfg.InternalRoot, "thumbnail", fmt.Sprintf("%s_page_%d_dpi_%d_fw.png", fileID, page, dpi))
+}
+
+// legacyPreviewCachePath is the cache object name used before pages were
+// rendered at a fixed width. It is only used to clean up on delete.
+func (h *Handler) legacyPreviewCachePath(fileID string, page, dpi int) string {
 	return path.Join(h.cfg.InternalRoot, "thumbnail", fmt.Sprintf("%s_page_%d_dpi_%d.png", fileID, page, dpi))
 }
 func (h *Handler) bucketName() string {
