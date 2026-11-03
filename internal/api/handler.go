@@ -29,6 +29,22 @@ const firstPagePreviewDPI = 72
 // background at the same time. Further documents wait for a free slot.
 const maxBackgroundPrewarms = 2
 
+// pageCountRetryCooldown prevents repeatedly downloading an unrepairable PDF
+// on every stats/preview request, while allowing transient storage failures
+// to recover without restarting the connector.
+const pageCountRetryCooldown = 5 * time.Minute
+
+// pageCountRepairTimeout bounds a background page-count repair. The repair
+// is detached from the request, so a large migrated PDF finishes downloading
+// and gets its metadata fixed even after the DSS Java client (5 s read
+// timeout) has given up on the request that started it.
+const pageCountRepairTimeout = 10 * time.Minute
+
+// pageCountRequestWait is how long a stats/getimage request waits for a
+// running repair before answering with the current metadata. It stays below
+// the DSS Java client's 5 s read timeout.
+const pageCountRequestWait = 2500 * time.Millisecond
+
 type Handler struct {
 	cfg     config.Config
 	client  *storage.Client
@@ -57,17 +73,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("request start: %s %s remote=%s content-type=%q content-length=%d transfer-encoding=%v expect=%q\n",
 		r.Method, r.URL.RequestURI(), r.RemoteAddr, r.Header.Get("Content-Type"), r.ContentLength, r.TransferEncoding, r.Header.Get("Expect"))
 
-	// Retrieval failover: try configured peer connectors first. Peer requests
-	// carry a guard header so they execute only their local retrieval path.
+	// Prefer this connector for stats and previews when its metadata exists so
+	// page-count repairs are not bypassed by an older peer's successful reply.
+	// Other retrieval requests retain peer-first failover behavior.
 	if r.Method == http.MethodGet && r.Header.Get("X-DSS-Fallback-Hop") != "1" &&
 		(isRetrievalPath(r.URL.Path)) {
-		found, err := h.tryPeerRetrieval(w, r)
-		if found {
-			return
+		tryPeer := true
+		if fileID, ok := localFirstMetadataFileID(r.URL.Path); ok {
+			exists, err := h.client.Exists(r.Context(), h.metaPath(fileID))
+			if err == nil && exists {
+				tryPeer = false
+				fmt.Printf("retrieval routed locally for page-count repair cid=%s\n", fileID)
+			}
 		}
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": "Peer retrieval failed; CID absence was not established."})
-			return
+		if tryPeer {
+			found, err := h.tryPeerRetrieval(w, r)
+			if found {
+				return
+			}
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": true, "message": "Peer retrieval failed; CID absence was not established."})
+				return
+			}
 		}
 	}
 
@@ -859,6 +886,12 @@ func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request, fileID stri
 			pageCount = n
 		}
 	}
+	if n, ok := h.readStoredPageCount(r.Context(), fileID); ok {
+		pageCount = n
+		if err := h.client.Delete(r.Context(), h.pageCountPath(fileID)); err != nil {
+			fmt.Printf("delete stored page count skipped for %s: %v\n", fileID, err)
+		}
+	}
 
 	// Preview caches are derived data. Missing cache objects are harmless.
 	for page := 1; page <= pageCount; page++ {
@@ -1408,7 +1441,9 @@ func (h *Handler) prewarmPDFPreviewBatch(
 			"file",
 			path.Base(cachePath),
 			pngBytes,
-		); err != nil {
+		); err != nil && !storage.IsAlreadyExists(err) {
+			// "Already exists" means the page is cached already (HCP does
+			// not allow overwriting), which is what prewarm wants.
 			return fmt.Errorf(
 				"upload prewarmed page %d: %w",
 				page,
@@ -1556,62 +1591,111 @@ func metaLooksLikePDF(fileID string, meta storage.FileMeta) bool {
 // PDF itself rather than defaulted.
 const pageCountVerifiedTag = "page_count_verified"
 
+// pageCountRepairedTag distinguishes a PDF count re-read by this connector
+// from older metadata that may have an incorrect verified marker.
+const pageCountRepairedTag = "page_count_repaired"
+
+func pageCountMetadataTrusted(meta storage.FileMeta) bool {
+	rawCount := strings.TrimSpace(meta.Tags["page_count"])
+	n, err := strconv.Atoi(rawCount)
+	if err != nil || n < 1 {
+		return false
+	}
+	if n > 1 {
+		return true
+	}
+	// A count of 1 is trusted only once this connector has re-read it from
+	// the PDF itself. Migrated metadata may carry a stale "verified" marker,
+	// so that tag alone is not enough.
+	return strings.TrimSpace(meta.Tags[pageCountRepairedTag]) == "true"
+}
+
 // ensurePageCount repairs metadata whose page_count cannot be trusted:
-// missing, invalid, or "1" without the verified tag. Uploads (including the
-// migration) wrote a default of 1 whenever pdfinfo failed, so stats reported
-// a single page and getimage rejected every page after the first. Counts
-// above 1 always came from pdfinfo and are trusted.
+// missing, invalid, or "1" not yet re-read by this connector (migrated
+// documents were stored with a default of 1).
 //
-// The PDF is downloaded once, its page count is written back into the
-// metadata object, meta is updated in place, and all pages are pre-rendered
-// in the background. Errors are logged and leave meta unchanged, so callers
-// fall back to the previous behaviour.
+// The repair runs in the background, detached from the request: the PDF is
+// downloaded, its page count is written back into the metadata object, and
+// all pages are pre-rendered. The request waits up to pageCountRequestWait;
+// if the repair finishes in time meta is updated in place, otherwise the
+// current metadata is used and the next view sees the repaired count.
 func (h *Handler) ensurePageCount(ctx context.Context, fileID string, meta *storage.FileMeta) {
-	if v := strings.TrimSpace(meta.Tags["page_count"]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && (n > 1 || (n == 1 && meta.Tags[pageCountVerifiedTag] == "true")) {
-			return
-		}
+	rawCount := strings.TrimSpace(meta.Tags["page_count"])
+	verified := strings.TrimSpace(meta.Tags[pageCountVerifiedTag])
+	fmt.Printf("PAGECOUNT DEBUG: cid=%s storage=%q content_type=%q filename=%q count=%q verified=%q\n",
+		fileID, meta.StoragePath, meta.ContentType, meta.Tags["original_filename"], rawCount, verified)
+
+	if pageCountMetadataTrusted(*meta) {
+		fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=skip reason=trusted_metadata count=%q verified=%q repaired=%q\n",
+			fileID, rawCount, verified, meta.Tags[pageCountRepairedTag])
+		return
 	}
 
 	if !metaLooksLikePDF(fileID, *meta) {
+		fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=skip reason=not_pdf\n", fileID)
 		return
 	}
 
-	// Don't download the same file on every view when repair keeps failing
-	// (for example, a damaged PDF). Retried after a connector restart.
-	if _, failed := h.pageCountFailures.Load(fileID); failed {
+	// A repaired count is kept in its own object (see savePageCount).
+	if n, ok := h.readStoredPageCount(ctx, fileID); ok {
+		fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=skip reason=stored_page_count count=%d\n", fileID, n)
+		setMetaPageCount(meta, n)
 		return
+	}
+
+	// Throttle repeated failed repairs. A cooldown (rather than a permanent
+	// failure marker) lets transient Hitachi/S3 or network errors recover
+	// without requiring a connector restart.
+	if failedAt, failed := h.pageCountFailures.Load(fileID); failed {
+		if time.Since(failedAt.(time.Time)) < pageCountRetryCooldown {
+			fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=skip reason=cooldown\n", fileID)
+			return
+		}
+		h.pageCountFailures.Delete(fileID)
 	}
 
 	call := &pageCountCall{done: make(chan struct{})}
 	if existing, loaded := h.pageCountCalls.LoadOrStore(fileID, call); loaded {
-		other := existing.(*pageCountCall)
-		select {
-		case <-other.done:
-		case <-ctx.Done():
-			return
-		}
-		if other.err == nil {
-			setMetaPageCount(meta, other.pageCount)
-		}
+		fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=join_inflight\n", fileID)
+		call = existing.(*pageCountCall)
+	} else {
+		fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=starting\n", fileID)
+		go h.runPageCountRepair(fileID, *meta, call)
+	}
+
+	timer := time.NewTimer(pageCountRequestWait)
+	defer timer.Stop()
+
+	select {
+	case <-call.done:
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		fmt.Printf("PAGECOUNT DEBUG: cid=%s repair=continuing_in_background\n", fileID)
 		return
 	}
 
-	call.pageCount, call.err = h.repairPageCount(ctx, fileID, *meta)
-	h.pageCountCalls.Delete(fileID)
-	close(call.done)
+	if call.err == nil {
+		setMetaPageCount(meta, call.pageCount)
+	}
+}
+
+// runPageCountRepair performs one repair with its own timeout, independent of
+// the request that triggered it, and publishes the result on call.
+func (h *Handler) runPageCountRepair(fileID string, meta storage.FileMeta, call *pageCountCall) {
+	ctx, cancel := context.WithTimeout(context.Background(), pageCountRepairTimeout)
+	defer cancel()
+
+	call.pageCount, call.err = h.repairPageCount(ctx, fileID, meta)
 
 	if call.err != nil {
 		fmt.Printf("page count repair failed for %s: %v\n", fileID, call.err)
-		// A cancelled request (the client gave up) is not a file problem,
-		// so leave it to be retried on the next view.
-		if ctx.Err() == nil {
-			h.pageCountFailures.Store(fileID, struct{}{})
-		}
-		return
+		// Throttle retries; a later request may retry after the cooldown.
+		h.pageCountFailures.Store(fileID, time.Now())
 	}
 
-	setMetaPageCount(meta, call.pageCount)
+	h.pageCountCalls.Delete(fileID)
+	close(call.done)
 }
 
 func setMetaPageCount(meta *storage.FileMeta, pageCount int) {
@@ -1620,33 +1704,55 @@ func setMetaPageCount(meta *storage.FileMeta, pageCount int) {
 	}
 	meta.Tags["page_count"] = strconv.Itoa(pageCount)
 	meta.Tags[pageCountVerifiedTag] = "true"
+	meta.Tags[pageCountRepairedTag] = "true"
 }
 
-func (h *Handler) repairPageCount(ctx context.Context, fileID string, meta storage.FileMeta) (int, error) {
-	tmpDir, err := os.MkdirTemp(h.cfg.TempDir, "dms-page-count-")
+func fileSize(p string) int64 {
+	st, err := os.Stat(p)
 	if err != nil {
-		return 0, err
+		return -1
+	}
+	return st.Size()
+}
+
+// recountPageCount downloads the PDF into a new temp directory, reads its
+// page count and saves it into the metadata object. On success the caller
+// owns tmpDir (which holds pdfPath) and must remove it.
+func (h *Handler) recountPageCount(ctx context.Context, fileID string, meta storage.FileMeta) (pageCount int, pdfPath, tmpDir string, err error) {
+	tmpDir, err = os.MkdirTemp(h.cfg.TempDir, "dms-page-count-")
+	if err != nil {
+		return 0, "", "", err
 	}
 
-	pdfPath := filepath.Join(tmpDir, fileID+".pdf")
+	pdfPath = filepath.Join(tmpDir, "document.pdf")
 
 	if err := h.client.DownloadToFile(ctx, meta.StoragePath, pdfPath); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return 0, fmt.Errorf("download: %w", err)
+		return 0, "", "", fmt.Errorf("download from %q: %w", meta.StoragePath, err)
 	}
 
-	pageCount, err := detectPDFPageCount(pdfPath)
+	fmt.Printf("PAGECOUNT DEBUG: cid=%s download=ok local_size=%d\n", fileID, fileSize(pdfPath))
+	pageCount, err = detectPDFPageCount(pdfPath)
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return 0, err
+		return 0, "", "", err
 	}
 
-	if err := h.saveMetaPageCount(ctx, fileID, pageCount); err != nil {
+	if err := h.savePageCount(ctx, fileID, pageCount); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return 0, fmt.Errorf("save metadata: %w", err)
+		return 0, "", "", fmt.Errorf("save page count: %w", err)
 	}
 
 	fmt.Printf("page count repaired for %s: pages=%d\n", fileID, pageCount)
+
+	return pageCount, pdfPath, tmpDir, nil
+}
+
+func (h *Handler) repairPageCount(ctx context.Context, fileID string, meta storage.FileMeta) (int, error) {
+	pageCount, pdfPath, tmpDir, err := h.recountPageCount(ctx, fileID, meta)
+	if err != nil {
+		return 0, err
+	}
 
 	// Pre-render every page so later page views are served from cache.
 	// The background job owns tmpDir from here on.
@@ -1672,34 +1778,45 @@ func (h *Handler) repairPageCount(ctx context.Context, fileID string, meta stora
 	return pageCount, nil
 }
 
-// saveMetaPageCount sets tags.page_count in the stored metadata object.
-// The object is edited as raw JSON so fields this connector does not know
-// about (for example, ones written by the migration connector) are kept.
-func (h *Handler) saveMetaPageCount(ctx context.Context, fileID string, pageCount int) error {
-	var raw map[string]json.RawMessage
-	if err := h.client.ReadJSON(ctx, h.metaPath(fileID), &raw); err != nil {
-		return err
-	}
+// pageCountRecord is the content of a repaired page-count object.
+type pageCountRecord struct {
+	FileID     string    `json:"file_id"`
+	PageCount  int       `json:"page_count"`
+	RepairedAt time.Time `json:"repaired_at"`
+}
 
-	var tags storage.Tags
-	if rawTags, ok := raw["tags"]; ok {
-		if err := json.Unmarshal(rawTags, &tags); err != nil {
-			return fmt.Errorf("parse tags: %w", err)
+// savePageCount stores a page count read from the PDF in its own object,
+// pagecount/<id>.json, instead of rewriting meta/<id>.json: Hitachi HCP
+// namespaces without versioning refuse to overwrite an existing object
+// ("Object already exists."), and the migrated metadata stays untouched.
+// The object is only ever created, never replaced; if it already exists
+// (another server repaired the same document) that counts as success.
+func (h *Handler) savePageCount(ctx context.Context, fileID string, pageCount int) error {
+	err := h.client.UploadJSON(ctx, h.pageCountPath(fileID), pageCountRecord{
+		FileID:     fileID,
+		PageCount:  pageCount,
+		RepairedAt: time.Now().UTC(),
+	})
+	if storage.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+// readStoredPageCount returns the repaired page count saved by
+// savePageCount, if there is one.
+func (h *Handler) readStoredPageCount(ctx context.Context, fileID string) (int, bool) {
+	var rec pageCountRecord
+	if err := h.client.ReadJSON(ctx, h.pageCountPath(fileID), &rec); err != nil {
+		if !storage.IsObjectNotFound(err) {
+			fmt.Printf("PAGECOUNT DEBUG: cid=%s read stored page count failed: %v\n", fileID, err)
 		}
+		return 0, false
 	}
-	if tags == nil {
-		tags = storage.Tags{}
+	if rec.PageCount < 1 {
+		return 0, false
 	}
-	tags["page_count"] = strconv.Itoa(pageCount)
-	tags[pageCountVerifiedTag] = "true"
-
-	encodedTags, err := json.Marshal(tags)
-	if err != nil {
-		return err
-	}
-	raw["tags"] = encodedTags
-
-	return h.client.UploadJSON(ctx, h.metaPath(fileID), raw)
+	return rec.PageCount, true
 }
 
 func (h *Handler) moveBinaryToFailed(ctx context.Context, fileID, fileName, localPath string) (string, error) {
@@ -1732,6 +1849,9 @@ func (h *Handler) binaryPath(fileID string) string {
 func (h *Handler) metaPath(fileID string) string {
 	return path.Join(h.cfg.InternalRoot, "meta", fileID+".json")
 }
+func (h *Handler) pageCountPath(fileID string) string {
+	return path.Join(h.cfg.InternalRoot, "pagecount", fileID+".json")
+}
 func (h *Handler) previewCachePath(fileID string, page, dpi int) string {
 	return path.Join(h.cfg.InternalRoot, "thumbnail", fmt.Sprintf("%s_page_%d_dpi_%d.png", fileID, page, dpi))
 }
@@ -1758,6 +1878,21 @@ func isRetrievalPath(p string) bool {
 	return strings.HasPrefix(p, "/dss/api/stats/") ||
 		strings.HasPrefix(p, "/dss/api/get/") ||
 		strings.HasPrefix(p, "/dss/api/getimage/")
+}
+
+func localFirstMetadataFileID(requestPath string) (string, bool) {
+	var rest string
+	switch {
+	case strings.HasPrefix(requestPath, "/dss/api/stats/"):
+		rest = strings.TrimPrefix(requestPath, "/dss/api/stats/")
+	case strings.HasPrefix(requestPath, "/dss/api/getimage/"):
+		rest = strings.TrimPrefix(requestPath, "/dss/api/getimage/")
+	default:
+		return "", false
+	}
+
+	fileID := strings.TrimSpace(strings.SplitN(rest, "/", 2)[0])
+	return fileID, fileID != ""
 }
 
 // tryPeerRetrieval tries the configured remote connector endpoints. A peer

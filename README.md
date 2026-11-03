@@ -391,3 +391,26 @@ k6 run examples/k6-upload-perf.js
 ```
 
 If `k6` is not available, parallel `curl -F "bin=@..."` requests also work for basic upload benchmarking.
+
+## Repairing page counts of migrated documents
+
+Documents migrated from the old DSS were stored with `page_count = 1`, so the
+viewer showed only their first page. The connector repairs a document the
+first time it is viewed, but a large PDF may still show one page on that first
+view. To fix every migrated document up front, run the one-time backfill:
+
+```bash
+go build -o bin/repair-page-counts ./cmd/repair-page-counts
+
+# Uses the same HITACHI_* / TEMP_DIR environment as the connector.
+# pdfinfo must be installed (pdftoppm too when using -prewarm).
+./bin/repair-page-counts -dry-run      # report how many documents need repair
+./bin/repair-page-counts -workers 4    # repair them
+```
+
+- Safe to stop with Ctrl+C and run again: repaired documents are skipped.
+- Failed document IDs are written to `page-count-failures.txt`; retry them
+  with `-cid $(paste -sd, page-count-failures.txt)`.
+- `-prewarm` also renders every page into the preview cache (much slower);
+  without it, pages are rendered the first time they are viewed.
+- `-limit N` stops after N documents, useful for a trial run.

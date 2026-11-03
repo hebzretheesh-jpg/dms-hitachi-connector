@@ -111,16 +111,18 @@ getimage/1968554725778952192/2 -> HTTP 400
 
 Metadata now carries a `page_count_verified = "true"` tag when the count was read from the PDF itself. New uploads set it when `pdfinfo` succeeds. If `pdfinfo` fails during an upload, the connector logs `PDF page count detection failed for <filename>: <error>`.
 
-`ensurePageCount` (in `internal/api/handler.go`) runs on `stats` and `getimage`. It trusts a `page_count` above 1. When the value is missing, invalid, or `1` without the verified tag, it:
+`ensurePageCount` (in `internal/api/handler.go`) runs on `stats` and `getimage`. It trusts a `page_count` above 1. When the value is missing, invalid, or `1` without the connector's recheck marker, it:
 
 1. downloads the PDF once (through the local download cache) and counts its pages with `pdfinfo`,
-2. writes `tags.page_count` and `tags.page_count_verified` back to the metadata object. The object is edited as raw JSON, so any other fields written by the migration connector are kept.
+2. writes `tags.page_count`, `tags.page_count_verified`, and `tags.page_count_repaired` back to the metadata object. The separate recheck marker ensures old migrated metadata with a stale verified tag and a fallback count of 1 is recounted once. The object is edited as raw JSON, so any other fields written by the migration connector are kept.
 3. returns the correct count in the same response,
 4. pre-renders every page in the background, the same way new uploads are handled.
 
 Concurrent `stats` and `getimage` requests for the same document share one repair. Each document is repaired once, the first time it is opened. After that the metadata is correct and nothing extra happens. Genuine single-page PDFs are checked once and then marked as verified.
 
-If a repair fails for a reason other than the client giving up (for example, a damaged PDF or `pdfinfo` missing), the connector won't retry that document until it restarts. This stops it downloading the same file on every view.
+For `stats` and `getimage`, a connector now handles the request locally when its metadata exists instead of accepting an early HTTP 200 from a peer. This ensures the page-count repair runs on the receiving connector; peer retrieval remains available when local metadata is absent.
+
+If a repair fails for a reason other than the client giving up (for example, a damaged PDF or `pdfinfo` missing), the connector throttles retries for five minutes. This avoids downloading the same file on every view while allowing transient storage or network failures to recover without a restart.
 
 **Prerequisite:** `pdfinfo` and `pdftoppm` (package `poppler-utils`) must be installed on **every** server running the connector. The connectors forward `stats` and `getimage` requests to their peers (`DSS_SERVER_*`), so whichever connector answers must have the new binary and the poppler tools.
 

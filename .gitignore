@@ -15,3 +15,7 @@ hitachiFS/data/
 .vscode/
 .idea/
 
+
+# repair tool settings (contain secrets)
+repair-page-counts.env
+page-count-failures.txt

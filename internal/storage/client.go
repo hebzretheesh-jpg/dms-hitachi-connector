@@ -45,6 +45,22 @@ func IsObjectNotFound(err error) bool {
 	return false
 }
 
+// IsAlreadyExists reports whether a write failed because the object already
+// exists and the storage refuses to overwrite it. Hitachi HCP namespaces
+// without versioning answer an overwrite with "Object already exists."
+func IsAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var resp minio.ErrorResponse
+	if errors.As(err, &resp) && strings.Contains(strings.ToLower(resp.Message+" "+resp.Code), "already exist") {
+		return true
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "already exist")
+}
+
 type Tags map[string]string
 
 // MarshalJSON encodes Tags as a JSON string containing the serialized object.
@@ -428,6 +444,34 @@ func (c *Client) Exists(ctx context.Context, filerPath string) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// List calls fn for every object under dir (recursively). Names are passed
+// in the same form the other Client methods accept, i.e. relative to the
+// client's prefix. Listing stops at the first error returned by fn.
+func (c *Client) List(ctx context.Context, dir string, fn func(name string) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	listPrefix := strings.TrimSuffix(c.objectKey(dir), "/") + "/"
+	stripPrefix := ""
+	if c.prefix != "" {
+		stripPrefix = c.prefix + "/"
+	}
+
+	for object := range c.client.ListObjects(ctx, c.bucket, minio.ListObjectsOptions{
+		Prefix:    listPrefix,
+		Recursive: true,
+	}) {
+		if object.Err != nil {
+			return object.Err
+		}
+		if err := fn(strings.TrimPrefix(object.Key, stripPrefix)); err != nil {
+			return err
+		}
+	}
+
+	return ctx.Err()
 }
 
 func copyFile(srcPath, dstPath string) error {

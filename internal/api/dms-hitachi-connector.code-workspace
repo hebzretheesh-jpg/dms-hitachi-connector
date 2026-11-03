@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../VisualStudioProjects"
+		},
+		{
+			"path": "../../../cmoworkspace/cmocmdrflatest"
+		}
+	],
+	"settings": {}
+}
