@@ -57,12 +57,12 @@ func Load() (Config, error) {
 
 		ReadTimeout: getDurationEnv(
 			"READ_TIMEOUT",
-			30*time.Second,
+			10*time.Minute,
 		),
 
 		WriteTimeout: getDurationEnv(
 			"WRITE_TIMEOUT",
-			5*time.Minute,
+			15*time.Minute,
 		),
 
 		IdleTimeout: getDurationEnv(

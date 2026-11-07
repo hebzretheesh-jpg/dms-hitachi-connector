@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1925,12 +1926,28 @@ func localFirstMetadataFileID(requestPath string) (string, bool) {
 	return fileID, fileID != ""
 }
 
+// peerHTTPClient relays retrievals from the other connectors. It has no
+// overall Timeout: http.Client.Timeout also covers reading the body, so a
+// 30 s limit cut off any large download that was served by a peer. Connect
+// and first-byte limits still catch a dead peer; the body is bounded by the
+// incoming request's context and this server's WriteTimeout.
+var peerHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   16,
+	},
+}
+
 // tryPeerRetrieval tries the configured remote connector endpoints. A peer
 // 404 is the only response that permits continuing. Any transport failure
 // or non-404 response is relayed/treated as a terminal outcome.
 func (h *Handler) tryPeerRetrieval(w http.ResponseWriter, r *http.Request) (bool, error) {
 	localName := strings.TrimSpace(os.Getenv("DSS_LOCAL_SERVER_NAME"))
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := peerHTTPClient
 	for i := 1; i <= 3; i++ {
 		name := strings.TrimSpace(os.Getenv(fmt.Sprintf("DSS_SERVER_%d_NAME", i)))
 		base := strings.TrimRight(strings.TrimSpace(os.Getenv(fmt.Sprintf("DSS_SERVER_%d_URL", i))), "/")

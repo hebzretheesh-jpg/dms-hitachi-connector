@@ -169,8 +169,8 @@ Required:
 Optional:
 
 - `LISTEN_ADDR=:9082`
-- `READ_TIMEOUT=30s`
-- `WRITE_TIMEOUT=5m`
+- `READ_TIMEOUT=10m` (whole request incl. upload body; headers are limited to 30s)
+- `WRITE_TIMEOUT=15m` (whole response incl. large downloads)
 - `IDLE_TIMEOUT=60s`
 - `HITACHI_OBJECT_PREFIX=/connector/dms`
 - `HITACHI_HTTP_TIMEOUT=60s`
@@ -202,8 +202,8 @@ Required environment variables:
 Optional environment variables:
 
 - `LISTEN_ADDR=:9082`
-- `READ_TIMEOUT=30s`
-- `WRITE_TIMEOUT=5m`
+- `READ_TIMEOUT=10m` (whole request incl. upload body; headers are limited to 30s)
+- `WRITE_TIMEOUT=15m` (whole response incl. large downloads)
 - `IDLE_TIMEOUT=60s`
 - `HITACHI_OBJECT_PREFIX=/connector/dms`
 - `HITACHI_HTTP_TIMEOUT=60s`
